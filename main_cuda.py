@@ -1,63 +1,86 @@
 from collections import defaultdict
 import math
-from random import normalvariate
-from matplotlib import pyplot as plt
-from env_cuda import Env
+from random import normalvariate  # 生成正态分布随机数
+from matplotlib import pyplot as plt  # 绘图库
+from env_cuda import Env  # 自定义CUDA加速的环境
 import torch
-from torch.nn import functional as F
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+from torch.nn import functional as F  # 神经网络函数工具
+from torch.optim import AdamW  # 优化器
+from torch.optim.lr_scheduler import CosineAnnealingLR  # 学习率调度器
+from torch.utils.tensorboard import SummaryWriter  # 训练过程可视化
+from tqdm import tqdm  # 进度条工具
 
 import argparse
-from model import Model
+from model import Model  # 自定义神经网络模型
 
-
+# 解析命令行参数
 parser = argparse.ArgumentParser()
-parser.add_argument('--resume', default=None)
-parser.add_argument('--batch_size', type=int, default=64)
-parser.add_argument('--num_iters', type=int, default=50000)
-parser.add_argument('--coef_v', type=float, default=1.0, help='smooth l1 of norm(v_set - v_real)')
-parser.add_argument('--coef_speed', type=float, default=0.0, help='legacy')
-parser.add_argument('--coef_v_pred', type=float, default=2.0, help='mse loss for velocity estimation (no odom)')
-parser.add_argument('--coef_collide', type=float, default=2.0, help='softplus loss for collision (large if close to obstacle, zero otherwise)')
-parser.add_argument('--coef_obj_avoidance', type=float, default=1.5, help='quadratic clearance loss')
-parser.add_argument('--coef_d_acc', type=float, default=0.01, help='control acceleration regularization')
-parser.add_argument('--coef_d_jerk', type=float, default=0.001, help='control jerk regularizatinon')
-parser.add_argument('--coef_d_snap', type=float, default=0.0, help='legacy')
-parser.add_argument('--coef_ground_affinity', type=float, default=0., help='legacy')
-parser.add_argument('--coef_bias', type=float, default=0.0, help='legacy')
-parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--grad_decay', type=float, default=0.4)
-parser.add_argument('--speed_mtp', type=float, default=1.0)
-parser.add_argument('--fov_x_half_tan', type=float, default=0.53)
-parser.add_argument('--timesteps', type=int, default=150)
-parser.add_argument('--cam_angle', type=int, default=10)
-parser.add_argument('--single', default=False, action='store_true')
-parser.add_argument('--gate', default=False, action='store_true')
-parser.add_argument('--ground_voxels', default=False, action='store_true')
-parser.add_argument('--scaffold', default=False, action='store_true')
-parser.add_argument('--random_rotation', default=False, action='store_true')
-parser.add_argument('--yaw_drift', default=False, action='store_true')
-parser.add_argument('--no_odom', default=False, action='store_true')
+# 模型相关参数
+parser.add_argument("--resume", default=None)  # 预训练模型路径
+parser.add_argument("--batch_size", type=int, default=64)  # 批大小
+parser.add_argument("--num_iters", type=int, default=50000)  # 训练迭代次数
+# 损失函数权重系数
+parser.add_argument("--coef_v", type=float, default=1.0, help="smooth l1 of norm(v_set - v_real)")
+parser.add_argument("--coef_speed", type=float, default=0.0, help="legacy")  # 遗留参数
+parser.add_argument("--coef_v_pred", type=float, default=2.0, help="mse loss for velocity estimation (no odom)")
+parser.add_argument("--coef_collide", type=float, default=2.0, help="softplus loss for collision")
+parser.add_argument("--coef_obj_avoidance", type=float, default=1.5, help="quadratic clearance loss")
+parser.add_argument("--coef_d_acc", type=float, default=0.01, help="control acceleration regularization")
+parser.add_argument("--coef_d_jerk", type=float, default=0.001, help="control jerk regularizatinon")
+parser.add_argument("--coef_d_snap", type=float, default=0.0, help="legacy")  # 遗留参数
+parser.add_argument("--coef_ground_affinity", type=float, default=0.0, help="legacy")  # 遗留参数
+parser.add_argument("--coef_bias", type=float, default=0.0, help="legacy")  # 遗留参数
+# 训练参数
+parser.add_argument("--lr", type=float, default=1e-3)  # 学习率
+parser.add_argument("--grad_decay", type=float, default=0.4)  # 梯度衰减系数
+# 环境/传感器参数
+parser.add_argument("--speed_mtp", type=float, default=1.0)  # 最大目标速度倍数
+parser.add_argument("--fov_x_half_tan", type=float, default=0.53)  # 相机水平视场角正切值
+parser.add_argument("--timesteps", type=int, default=150)  # 每个episode的时间步长
+parser.add_argument("--cam_angle", type=int, default=10)  # 相机角度
+# 环境配置标志
+parser.add_argument("--single", default=False, action="store_true")  # 单一障碍模式
+parser.add_argument("--gate", default=False, action="store_true")  # 门形障碍模式
+parser.add_argument("--ground_voxels", default=False, action="store_true")  # 使用地面体素
+parser.add_argument("--scaffold", default=False, action="store_true")  # 脚手架模式
+parser.add_argument("--random_rotation", default=False, action="store_true")  # 随机旋转
+parser.add_argument("--yaw_drift", default=False, action="store_true")  # 偏航漂移模拟
+parser.add_argument("--no_odom", default=False, action="store_true")  # 不使用里程计
 args = parser.parse_args()
+
+# 初始化TensorBoard记录器
 writer = SummaryWriter()
-print(args)
+print(args)  # 打印参数配置
 
-device = torch.device('cuda')
+device = torch.device("cuda")  # 使用CUDA设备
 
-env = Env(args.batch_size, 64, 48, args.grad_decay, device,
-          fov_x_half_tan=args.fov_x_half_tan, single=args.single,
-          gate=args.gate, ground_voxels=args.ground_voxels,
-          scaffold=args.scaffold, speed_mtp=args.speed_mtp,
-          random_rotation=args.random_rotation, cam_angle=args.cam_angle)
+# 创建环境实例
+env = Env(
+    args.batch_size,
+    # 576,
+    # 288,  # 深度图分辨率
+    64,
+    48,  # 深度图分辨率
+    args.grad_decay,
+    device,
+    fov_x_half_tan=args.fov_x_half_tan,
+    single=args.single,
+    gate=args.gate,
+    ground_voxels=args.ground_voxels,
+    scaffold=args.scaffold,
+    speed_mtp=args.speed_mtp,
+    random_rotation=args.random_rotation,
+    cam_angle=args.cam_angle,
+)
+
+# 创建模型 (输入通道数根据是否使用里程计决定)
 if args.no_odom:
-    model = Model(7, 6)
+    model = Model(7, 6)  # 无里程计: 7维状态输入
 else:
-    model = Model(7+3, 6)
+    model = Model(7 + 3, 6)  # 有里程计: 10维状态输入
 model = model.to(device)
 
+# 加载预训练模型（如果指定）
 if args.resume:
     state_dict = torch.load(args.resume, map_location=device)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, False)
@@ -65,212 +88,285 @@ if args.resume:
         print("missing_keys:", missing_keys)
     if unexpected_keys:
         print("unexpected_keys:", unexpected_keys)
+
+# 初始化优化器和学习率调度器
 optim = AdamW(model.parameters(), args.lr)
-sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)
+sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)  # 余弦退火调度
 
-ctl_dt = 1 / 15
+ctl_dt = 1 / 15  # 控制时间间隔 (约15Hz)
 
-
+# 用于平滑记录训练指标
 scaler_q = defaultdict(list)
+
+
 def smooth_dict(ori_dict):
+    """将当前指标值添加到平滑队列"""
     for k, v in ori_dict.items():
         scaler_q[k].append(float(v))
 
+
 def barrier(x: torch.Tensor, v_to_pt):
+    """障碍物避让损失函数（二次惩罚）"""
     return (v_to_pt * (1 - x).relu().pow(2)).mean()
 
+
 def is_save_iter(i):
+    """判断当前迭代是否需要保存结果"""
     if i < 2000:
         return (i + 1) % 250 == 0
     return (i + 1) % 1000 == 0
 
-pbar = tqdm(range(args.num_iters), ncols=80)
-# depths = []
-# states = []
+
+# 主训练循环
+pbar = tqdm(range(args.num_iters), ncols=80)  # 进度条
 B = args.batch_size
 for i in pbar:
+    # 重置环境和模型状态
     env.reset()
     model.reset()
-    p_history = []
-    v_history = []
-    target_v_history = []
-    vec_to_pt_history = []
-    act_diff_history = []
-    v_preds = []
-    vid = []
-    v_net_feats = []
-    h = None
 
-    act_lag = 1
-    act_buffer = [env.act] * (act_lag + 1)
+    # 初始化历史记录容器
+    p_history = []  # 位置历史
+    v_history = []  # 速度历史
+    target_v_history = []  # 目标速度历史
+    vec_to_pt_history = []  # 到最近点的向量历史
+    act_diff_history = []  # 动作变化历史
+    v_preds = []  # 预测速度历史
+    vid = []  # 视频帧缓存
+    v_net_feats = []  # 网络特征缓存
+    h = None  # GRU隐藏状态
+
+    act_lag = 1  # 动作延迟
+    act_buffer = [env.act] * (act_lag + 1)  # 动作缓冲区
+
+    # 计算初始目标速度
     target_v_raw = env.p_target - env.p
+
+    # 偏航漂移模拟（如果启用）
     if args.yaw_drift:
-        drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 / 15)
+        drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 / 15)  # 5度/秒的标准差
         zeros = torch.zeros_like(drift_av)
         ones = torch.ones_like(drift_av)
-        R_drift = torch.stack([
-            torch.cos(drift_av), -torch.sin(drift_av), zeros,
-            torch.sin(drift_av), torch.cos(drift_av), zeros,
-            zeros, zeros, ones,
-        ], -1).reshape(B, 3, 3)
+        # 构建漂移旋转矩阵
+        R_drift = torch.stack(
+            [
+                torch.cos(drift_av),
+                -torch.sin(drift_av),
+                zeros,
+                torch.sin(drift_av),
+                torch.cos(drift_av),
+                zeros,
+                zeros,
+                zeros,
+                ones,
+            ],
+            -1,
+        ).reshape(B, 3, 3)
 
-
+    # 时间步循环 (一个episode)
     for t in range(args.timesteps):
+        # 随机控制时间间隔（模拟现实时间变化）
         ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+
+        # 渲染深度图和光流图
         depth, flow = env.render(ctl_dt)
         p_history.append(env.p)
-        vec_to_pt_history.append(env.find_vec_to_nearest_pt())
+        vec_to_pt_history.append(env.find_vec_to_nearest_pt())  # 计算到最近障碍物的向量
 
+        # 保存视频帧（特定迭代）
         if is_save_iter(i):
-            vid.append(depth[4])
+            vid.append(depth[4])  # 取batch中第5个样本
 
+        # 更新目标速度（考虑偏航漂移）
         if args.yaw_drift:
             target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
         else:
             target_v_raw = env.p_target - env.p.detach()
+
+        # 环境执行动作
         env.run(act_buffer[t], ctl_dt, target_v_raw)
 
+        # 获取当前旋转矩阵
         R = env.R
         fwd = env.R[:, :, 0].clone()
         up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0
-        up[:, 2] = 1
-        fwd = F.normalize(fwd, 2, -1)
-        R = torch.stack([fwd, torch.cross(up, fwd), up], -1)
+        fwd[:, 2] = 0  # 水平前向
+        up[:, 2] = 1  # 垂直向上
+        fwd = F.normalize(fwd, 2, -1)  # 归一化
+        R = torch.stack([fwd, torch.cross(up, fwd), up], -1)  # 重建yaw-only旋转矩阵
 
+        # 构建状态向量
         target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
         target_v_unit = target_v_raw / target_v_norm
-        target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)
+        target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)  # 限速
         state = [
-            torch.squeeze(target_v[:, None] @ R, 1),
-            env.R[:, 2],
-            env.margin[:, None]]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)
-        if not args.no_odom:
+            torch.squeeze(target_v[:, None] @ R, 1),  # 目标速度（机体坐标系）
+            env.R[:, 2],  # Z轴方向
+            env.margin[:, None],  # 安全距离
+        ]
+        local_v = torch.squeeze(env.v[:, None] @ R, 1)  # 当前速度（机体坐标系）
+        if not args.no_odom:  # 包含里程计信息
             state.insert(0, local_v)
-        state = torch.cat(state, -1)
+        state = torch.cat(state, -1)  # 拼接状态向量
 
-        # normalize
-        x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02
-        x = F.max_pool2d(x[:, None], 4, 4)
-        act, values, h = model(x, state, h)
+        # 预处理深度图
+        x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02  # 深度转伪RGB+噪声
+        x = F.max_pool2d(x[:, None], 4, 4)  # 降采样 (64x48 -> 16x12)
 
+        # 模型前向传播
+        act, values, h = model(x, state, h)  # 输出动作和隐藏状态
+
+        # 转换动作到世界坐标系
         a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
         v_preds.append(v_pred)
+        # 应用推力估计误差校正
         act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
-        act_buffer.append(act)
-        v_net_feats.append(torch.cat([act, local_v, h], -1))
+        act_buffer.append(act)  # 存储到动作缓冲区
+        v_net_feats.append(torch.cat([act, local_v, h], -1))  # 保存网络特征
 
+        # 记录历史数据
         v_history.append(env.v)
         target_v_history.append(target_v)
 
+    # --- 损失计算 ---
     p_history = torch.stack(p_history)
+    # 地面亲和损失（保持一定高度）
     loss_ground_affinity = p_history[..., 2].relu().pow(2).mean()
-    act_buffer = torch.stack(act_buffer)
 
+    act_buffer = torch.stack(act_buffer)
     v_history = torch.stack(v_history)
+
+    # 速度跟踪损失（平滑L1）
     v_history_cum = v_history.cumsum(0)
-    v_history_avg = (v_history_cum[30:] - v_history_cum[:-30]) / 30
+    v_history_avg = (v_history_cum[30:] - v_history_cum[:-30]) / 30  # 30帧滑动平均
     target_v_history = torch.stack(target_v_history)
     T, B, _ = v_history.shape
-    delta_v = torch.norm(v_history_avg - target_v_history[1:1-30], 2, -1)
+    delta_v = torch.norm(v_history_avg - target_v_history[1 : 1 - 30], 2, -1)
     loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
 
+    # 速度预测损失（MSE）
     v_preds = torch.stack(v_preds)
     loss_v_pred = F.mse_loss(v_preds, v_history.detach())
 
+    # 速度方向偏差损失
     target_v_history_norm = torch.norm(target_v_history, 2, -1)
     target_v_history_normalized = target_v_history / target_v_history_norm[..., None]
-    fwd_v = torch.sum(v_history * target_v_history_normalized, -1)
+    fwd_v = torch.sum(v_history * target_v_history_normalized, -1)  # 速度在目标方向投影
     loss_bias = F.mse_loss(v_history, fwd_v[..., None] * target_v_history_normalized) * 3
 
-    jerk_history = act_buffer.diff(1, 0).mul(15)
-    snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)
-    loss_d_acc = act_buffer.pow(2).sum(-1).mean()
-    loss_d_jerk = jerk_history.pow(2).sum(-1).mean()
-    loss_d_snap = snap_history.pow(2).sum(-1).mean()
+    # 控制平滑性损失
+    jerk_history = act_buffer.diff(1, 0).mul(15)  # 加速度变化率
+    snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)  # 加加速度变化率
+    loss_d_acc = act_buffer.pow(2).sum(-1).mean()  # 加速度大小惩罚
+    loss_d_jerk = jerk_history.pow(2).sum(-1).mean()  # 急动度惩罚
+    loss_d_snap = snap_history.pow(2).sum(-1).mean()  # 加急动度惩罚
 
+    # 障碍物避让损失
     vec_to_pt_history = torch.stack(vec_to_pt_history)
-    distance = torch.norm(vec_to_pt_history, 2, -1)
-    distance = distance - env.margin
+    distance = torch.norm(vec_to_pt_history, 2, -1)  # 到最近障碍物距离
+    distance = distance - env.margin  # 减去安全裕度
     with torch.no_grad():
-        v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)
-    loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)
-    loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()
+        v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)  # 障碍物接近速度
+    loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)  # 二次障碍物损失
+    loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()  # 碰撞损失
 
+    # 速度大小损失
     speed_history = v_history.norm(2, -1)
     loss_speed = F.smooth_l1_loss(fwd_v, target_v_history_norm)
 
-    loss = args.coef_v * loss_v + \
-        args.coef_obj_avoidance * loss_obj_avoidance + \
-        args.coef_bias * loss_bias + \
-        args.coef_d_acc * loss_d_acc + \
-        args.coef_d_jerk * loss_d_jerk + \
-        args.coef_d_snap * loss_d_snap + \
-        args.coef_speed * loss_speed + \
-        args.coef_v_pred * loss_v_pred + \
-        args.coef_collide * loss_collide + \
-        args.coef_ground_affinity + loss_ground_affinity
+    # 总损失（加权求和）
+    loss = (
+        args.coef_v * loss_v
+        + args.coef_obj_avoidance * loss_obj_avoidance
+        + args.coef_bias * loss_bias
+        + args.coef_d_acc * loss_d_acc
+        + args.coef_d_jerk * loss_d_jerk
+        + args.coef_d_snap * loss_d_snap
+        + args.coef_speed * loss_speed
+        + args.coef_v_pred * loss_v_pred
+        + args.coef_collide * loss_collide
+        + args.coef_ground_affinity * loss_ground_affinity
+    )  # 注意：这里修正了参数使用
 
+    # 检查NaN损失
     if torch.isnan(loss):
         print("loss is nan, exiting...")
         exit(1)
 
-    pbar.set_description_str(f'loss: {loss:.3f}')
+    # 更新进度条描述
+    pbar.set_description_str(f"loss: {loss:.3f}")
+
+    # 反向传播和优化
     optim.zero_grad()
     loss.backward()
     optim.step()
-    sched.step()
+    sched.step()  # 更新学习率
 
-
+    # --- 评估与记录 ---
     with torch.no_grad():
         avg_speed = speed_history.mean(0)
+        # 判断任务成功（整个episode无碰撞）
         success = torch.all(distance.flatten(0, 1) > 0, 0)
-        _success = success.sum() / B
-        smooth_dict({
-            'loss': loss,
-            'loss_v': loss_v,
-            'loss_v_pred': loss_v_pred,
-            'loss_obj_avoidance': loss_obj_avoidance,
-            'loss_d_acc': loss_d_acc,
-            'loss_d_jerk': loss_d_jerk,
-            'loss_d_snap': loss_d_snap,
-            'loss_bias': loss_bias,
-            'loss_speed': loss_speed,
-            'loss_collide': loss_collide,
-            'loss_ground_affinity': loss_ground_affinity,
-            'success': _success,
-            'max_speed': speed_history.max(0).values.mean(),
-            'avg_speed': avg_speed.mean(),
-            'ar': (success * avg_speed).mean()})
-        log_dict = {}
+        _success = success.sum() / B  # 成功率
+
+        # 收集指标
+        smooth_dict(
+            {
+                "loss": loss,
+                "loss_v": loss_v,
+                "loss_v_pred": loss_v_pred,
+                "loss_obj_avoidance": loss_obj_avoidance,
+                "loss_d_acc": loss_d_acc,
+                "loss_d_jerk": loss_d_jerk,
+                "loss_d_snap": loss_d_snap,
+                "loss_bias": loss_bias,
+                "loss_speed": loss_speed,
+                "loss_collide": loss_collide,
+                "loss_ground_affinity": loss_ground_affinity,
+                "success": _success,
+                "max_speed": speed_history.max(0).values.mean(),
+                "avg_speed": avg_speed.mean(),
+                "ar": (success * avg_speed).mean(),
+            }
+        )  # 平均速度×成功率
+
+        # 定期保存可视化结果
         if is_save_iter(i):
-            # vid = torch.stack(vid).cpu().div(10).clamp(0, 1)[None, :, None]
+            # 位置历史图
             fig_p, ax = plt.subplots()
-            p_history = p_history[:, 4].cpu()
-            ax.plot(p_history[:, 0], label='x')
-            ax.plot(p_history[:, 1], label='y')
-            ax.plot(p_history[:, 2], label='z')
+            p_history_sample = p_history[:, 4].cpu()
+            ax.plot(p_history_sample[:, 0], label="x")
+            ax.plot(p_history_sample[:, 1], label="y")
+            ax.plot(p_history_sample[:, 2], label="z")
             ax.legend()
+
+            # 速度历史图
             fig_v, ax = plt.subplots()
-            v_history = v_history[:, 4].cpu()
-            ax.plot(v_history[:, 0], label='x')
-            ax.plot(v_history[:, 1], label='y')
-            ax.plot(v_history[:, 2], label='z')
+            v_history_sample = v_history[:, 4].cpu()
+            ax.plot(v_history_sample[:, 0], label="x")
+            ax.plot(v_history_sample[:, 1], label="y")
+            ax.plot(v_history_sample[:, 2], label="z")
             ax.legend()
+
+            # 动作历史图
             fig_a, ax = plt.subplots()
-            act_buffer = act_buffer[:, 4].cpu()
-            ax.plot(act_buffer[:, 0], label='x')
-            ax.plot(act_buffer[:, 1], label='y')
-            ax.plot(act_buffer[:, 2], label='z')
+            act_buffer_sample = act_buffer[:, 4].cpu()
+            ax.plot(act_buffer_sample[:, 0], label="x")
+            ax.plot(act_buffer_sample[:, 1], label="y")
+            ax.plot(act_buffer_sample[:, 2], label="z")
             ax.legend()
-            # writer.add_video('demo', vid, i + 1, 15)
-            writer.add_figure('p_history', fig_p, i + 1)
-            writer.add_figure('v_history', fig_v, i + 1)
-            writer.add_figure('a_reals', fig_a, i + 1)
+
+            # 写入TensorBoard
+            writer.add_figure("p_history", fig_p, i + 1)
+            writer.add_figure("v_history", fig_v, i + 1)
+            writer.add_figure("a_reals", fig_a, i + 1)
+
+        # 定期保存模型
         if (i + 1) % 10000 == 0:
-            torch.save(model.state_dict(), f'checkpoint{i//10000:04d}.pth')
+            torch.save(model.state_dict(), f"checkpoint{i//10000:04d}.pth")
+
+        # 定期记录指标到TensorBoard
         if (i + 1) % 25 == 0:
             for k, v in scaler_q.items():
-                writer.add_scalar(k, sum(v) / len(v), i + 1)
-            scaler_q.clear()
+                writer.add_scalar(k, sum(v) / len(v), i + 1)  # 写入平均值
+            scaler_q.clear()  # 清空队列

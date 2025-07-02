@@ -1,9 +1,8 @@
 #include <torch/extension.h>
-
 #include <cuda.h>
 #include <cuda_runtime.h>
-
 #include <vector>
+#include <math.h>
 
 namespace
 {
@@ -22,7 +21,10 @@ namespace
         torch::PackedTensorAccessor<scalar_t, 2, torch::RestrictPtrTraits, size_t> pos_old,
         float drone_radius,
         int n_drones_per_group,
-        float fov_x_half_tan)
+        float elevation_min,
+        float elevation_max,
+        float azimuth_min,
+        float azimuth_max)
     {
 
         const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -34,12 +36,23 @@ namespace
         const int b = c / (H * W);
         const int u = (c % (H * W)) / W;
         const int v = c % W;
-        const scalar_t fov_y_half_tan = fov_x_half_tan / W * H;
-        const scalar_t fu = (2 * (u + 0.5) / H - 1) * fov_y_half_tan - 1e-5;
-        const scalar_t fv = (2 * (v + 0.5) / W - 1) * fov_x_half_tan - 1e-5;
-        scalar_t dx = R[b][0][0] - fu * R[b][0][2] - fv * R[b][0][1];
-        scalar_t dy = R[b][1][0] - fu * R[b][1][2] - fv * R[b][1][1];
-        scalar_t dz = R[b][2][0] - fu * R[b][2][2] - fv * R[b][2][1];
+
+        // LiDAR光线方向计算
+        const scalar_t elevation = elevation_min + (elevation_max - elevation_min) *
+                                                       static_cast<scalar_t>(u) / (H - 1);
+        const scalar_t azimuth = azimuth_min + (azimuth_max - azimuth_min) *
+                                                   static_cast<scalar_t>(v) / (W - 1);
+
+        // 在LiDAR坐标系中的方向向量 (前:x, 右:y, 下:z)
+        const scalar_t dir_x = cos(elevation) * cos(azimuth);
+        const scalar_t dir_y = cos(elevation) * sin(azimuth);
+        const scalar_t dir_z = -sin(elevation);
+
+        // 使用旋转矩阵转换到世界坐标系
+        scalar_t dx = R[b][0][0] * dir_x + R[b][0][1] * dir_y + R[b][0][2] * dir_z;
+        scalar_t dy = R[b][1][0] * dir_x + R[b][1][1] * dir_y + R[b][1][2] * dir_z;
+        scalar_t dz = R[b][2][0] * dir_x + R[b][2][1] * dir_y + R[b][2][2] * dir_z;
+
         const scalar_t ox = pos[b][0];
         const scalar_t oy = pos[b][1];
         const scalar_t oz = pos[b][2];
@@ -320,42 +333,57 @@ namespace
     __global__ void rerender_backward_cuda_kernel(
         torch::PackedTensorAccessor<scalar_t, 4, torch::RestrictPtrTraits, size_t> depth,
         torch::PackedTensorAccessor<scalar_t, 4, torch::RestrictPtrTraits, size_t> dddp,
-        float fov_x_half_tan)
+        float azimuth_span,
+        float elevation_span,
+        int H,
+        int W)
     {
 
         const int c = blockIdx.x * blockDim.x + threadIdx.x;
         const int B = dddp.size(0);
-        const int H = dddp.size(2);
-        const int W = dddp.size(3);
-        if (c >= B * H * W)
+        const int h = dddp.size(2);
+        const int w = dddp.size(3);
+        if (c >= B * h * w)
             return;
-        const int b = c / (H * W);
-        const int u = (c % (H * W)) / W;
-        const int v = c % W;
+        const int b = c / (h * w);
+        const int u = (c % (h * w)) / w;
+        const int v = c % w;
 
-        const scalar_t unit = fov_x_half_tan / W;
-        const scalar_t d = (depth[b][0][u * 2][v * 2] + depth[b][0][u * 2 + 1][v * 2] + depth[b][0][u * 2][v * 2 + 1] + depth[b][0][u * 2 + 1][v * 2 + 1]) / 4 * unit;
-        const scalar_t dddy = (depth[b][0][u * 2][v * 2] + depth[b][0][u * 2 + 1][v * 2] - depth[b][0][u * 2][v * 2 + 1] - depth[b][0][u * 2 + 1][v * 2 + 1]) / 2 / d;
-        const scalar_t dddz = (depth[b][0][u * 2][v * 2] - depth[b][0][u * 2 + 1][v * 2] + depth[b][0][u * 2][v * 2 + 1] - depth[b][0][u * 2 + 1][v * 2 + 1]) / 2 / d;
-        // if ReRender.diff_kernel is None:
-        //     unit = 0.637 / depth.size(3)
-        //     ReRender.diff_kernel = torch.tensor([
-        //         [[1, -1], [1, -1]],
-        //         [[1, 1], [-1, -1]],
-        //         [[unit, unit], [unit, unit]],
-        //     ], device=device).mul(0.5)[:, None]
-        // ddepthdyz = F.conv2d(depth, ReRender.diff_kernel, None, 2)
-        // depth = ddepthdyz[:, 2:]
-        // ddepthdyz = torch.cat([
-        //     torch.full_like(depth, -1.),
-        //     ddepthdyz[:, :2] / depth,
-        // ], 1)
-        const scalar_t dddp_norm = max(8., sqrt(1 + dddy * dddy + dddz * dddz));
-        dddp[b][0][u][v] = -1. / dddp_norm;
-        dddp[b][1][u][v] = dddy / dddp_norm;
-        dddp[b][2][u][v] = dddz / dddp_norm;
-        // ddepthdyz /= ddepthdyz.norm(2, 1, True).clamp_min(8);
+        // 计算角度间隔
+        const scalar_t d_azimuth = azimuth_span / (W - 1);
+        const scalar_t d_elevation = elevation_span / (H - 1);
+
+        // 获取中心深度值
+        const scalar_t d_center = depth[b][0][u * 2][v * 2];
+
+        // 计算水平和垂直方向的深度梯度
+        scalar_t d_az = 0, d_el = 0;
+        if (v > 0 && v < W - 1)
+        {
+            d_az = (depth[b][0][u * 2][v * 2 + 1] - depth[b][0][u * 2][v * 2 - 1]) / (2 * d_azimuth);
+        }
+        if (u > 0 && u < H - 1)
+        {
+            d_el = (depth[b][0][(u + 1) * 2][v * 2] - depth[b][0][(u - 1) * 2][v * 2]) / (2 * d_elevation);
+        }
+
+        // 计算法向量 (归一化)
+        const scalar_t norm = sqrt(1 + d_az * d_az + d_el * d_el);
+        if (norm > 1e-5)
+        {
+            dddp[b][0][u][v] = -1.0 / norm;
+            dddp[b][1][u][v] = d_az / norm;
+            dddp[b][2][u][v] = d_el / norm;
+        }
+        else
+        {
+            dddp[b][0][u][v] = -1.0;
+            dddp[b][1][u][v] = 0.0;
+            dddp[b][2][u][v] = 0.0;
+        }
     }
+
+    // ... (nearest_pt_cuda_kernel 保持不变) ...
 
 } // namespace
 
@@ -372,7 +400,10 @@ void render_cuda(
     torch::Tensor pos_old,
     float drone_radius,
     int n_drones_per_group,
-    float fov_x_half_tan)
+    float elevation_min,
+    float elevation_max,
+    float azimuth_min,
+    float azimuth_max)
 {
     const int threads = 1024;
     size_t state_size = canvas.numel();
@@ -392,23 +423,37 @@ void render_cuda(
                                                                     pos_old.packed_accessor<scalar_t, 2, torch::RestrictPtrTraits, size_t>(),
                                                                     drone_radius,
                                                                     n_drones_per_group,
-                                                                    fov_x_half_tan); }));
+                                                                    elevation_min,
+                                                                    elevation_max,
+                                                                    azimuth_min,
+                                                                    azimuth_max); }));
 }
 
 void rerender_backward_cuda(
     torch::Tensor depth,
     torch::Tensor dddp,
-    float fov_x_half_tan)
+    float azimuth_min,
+    float azimuth_max,
+    float elevation_min,
+    float elevation_max)
 {
     const int threads = 1024;
     size_t state_size = dddp.numel();
     const dim3 blocks((state_size + threads - 1) / threads);
 
+    const int H = depth.size(2) / 2; // 原始高度
+    const int W = depth.size(3) / 2; // 原始宽度
+    const float azimuth_span = azimuth_max - azimuth_min;
+    const float elevation_span = elevation_max - elevation_min;
+
     AT_DISPATCH_FLOATING_TYPES(depth.type(), "rerender_backward_cuda", ([&]
                                                                         { rerender_backward_cuda_kernel<scalar_t><<<blocks, threads>>>(
                                                                               depth.packed_accessor<scalar_t, 4, torch::RestrictPtrTraits, size_t>(),
                                                                               dddp.packed_accessor<scalar_t, 4, torch::RestrictPtrTraits, size_t>(),
-                                                                              fov_x_half_tan); }));
+                                                                              azimuth_span,
+                                                                              elevation_span,
+                                                                              H,
+                                                                              W); }));
 }
 
 void find_nearest_pt_cuda(
