@@ -95,11 +95,12 @@ std::vector<torch::Tensor> run_backward_cuda(
 //   return render_cuda(input, weights, bias, old_h, old_cell);
 // }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("render", &render_cuda, "render (CUDA)");
-  m.def("find_nearest_pt", &find_nearest_pt_cuda, "find_nearest_pt (CUDA)");
-  m.def("update_state_vec", &update_state_vec_cuda, "update_state_vec (CUDA)");
-  m.def("run_forward", &run_forward_cuda, "run_forward_cuda (CUDA)");
-  m.def("run_backward", &run_backward_cuda, "run_backward_cuda (CUDA)");
-  m.def("rerender_backward", &rerender_backward_cuda, "rerender_backward_cuda (CUDA)");
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+{
+    m.def("render", &render_cuda, "render (CUDA)");
+    m.def("find_nearest_pt", &find_nearest_pt_cuda, "find_nearest_pt (CUDA)");
+    m.def("update_state_vec", &update_state_vec_cuda, "update_state_vec (CUDA)");
+    m.def("run_forward", &run_forward_cuda, "run_forward_cuda (CUDA)");
+    m.def("run_backward", &run_backward_cuda, "run_backward_cuda (CUDA)");
+    m.def("rerender_backward", &rerender_backward_cuda, "rerender_backward_cuda (CUDA)");
 }

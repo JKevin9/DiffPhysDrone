@@ -1,8 +1,10 @@
 import torch
 from torch import nn
 
+
 def g_decay(x, alpha):
     return x * alpha + x.detach() * (1 - alpha)
+
 
 class Model(nn.Module):
     def __init__(self, dim_obs=9, dim_action=4) -> None:
@@ -10,12 +12,12 @@ class Model(nn.Module):
         self.stem = nn.Sequential(
             nn.Conv2d(1, 32, 2, 2, bias=False),  # 1, 12, 16 -> 32, 6, 8
             nn.LeakyReLU(0.05),
-            nn.Conv2d(32, 64, 3, bias=False), #  32, 6, 8 -> 64, 4, 6
+            nn.Conv2d(32, 64, 3, bias=False),  #  32, 6, 8 -> 64, 4, 6
             nn.LeakyReLU(0.05),
-            nn.Conv2d(64, 128, 3, bias=False), #  64, 4, 6 -> 128, 2, 4
+            nn.Conv2d(64, 128, 3, bias=False),  #  64, 4, 6 -> 128, 2, 4
             nn.LeakyReLU(0.05),
             nn.Flatten(),
-            nn.Linear(128*2*4, 192, bias=False),
+            nn.Linear(128 * 2 * 4, 192, bias=False),
         )
         self.v_proj = nn.Linear(dim_obs, 192)
         self.v_proj.weight.data.mul_(0.5)
@@ -36,5 +38,5 @@ class Model(nn.Module):
         return act, None, hx
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     Model()
