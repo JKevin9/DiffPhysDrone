@@ -21,10 +21,10 @@ namespace
         torch::PackedTensorAccessor<scalar_t, 2, torch::RestrictPtrTraits, size_t> pos_old,
         float drone_radius,
         int n_drones_per_group,
-        float elevation_min,
-        float elevation_max,
         float azimuth_min,
-        float azimuth_max)
+        float azimuth_max,
+        float elevation_min,
+        float elevation_max)
     {
 
         const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -44,9 +44,11 @@ namespace
                                                    static_cast<scalar_t>(v) / (W - 1);
 
         // 在LiDAR坐标系中的方向向量 (前:x, 右:y, 下:z)
-        const scalar_t dir_x = cos(elevation) * cos(azimuth);
-        const scalar_t dir_y = cos(elevation) * sin(azimuth);
-        const scalar_t dir_z = -sin(elevation);
+        const scalar_t elevation_rad = elevation * M_PI / 180.0;
+        const scalar_t azimuth_rad = azimuth * M_PI / 180.0;
+        const scalar_t dir_x = cos(elevation_rad) * cos(azimuth_rad);
+        const scalar_t dir_y = cos(elevation_rad) * sin(azimuth_rad);
+        const scalar_t dir_z = sin(elevation_rad);
 
         // 使用旋转矩阵转换到世界坐标系
         scalar_t dx = R[b][0][0] * dir_x + R[b][0][1] * dir_y + R[b][0][2] * dir_z;
@@ -57,41 +59,41 @@ namespace
         const scalar_t oy = pos[b][1];
         const scalar_t oz = pos[b][2];
 
-        scalar_t min_dist = 100;
-        scalar_t t = (-1 - oz) / dz;
-        if (t > 0)
-            min_dist = t;
+        scalar_t min_dist = 15;
+        // scalar_t t = (-1 - oz) / dz;
+        // if (t > 0)
+        //     min_dist = t;
 
         // others
         const int batch_base = (b / n_drones_per_group) * n_drones_per_group;
-        for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
-        {
-            if (i == b || i >= B)
-                continue;
-            scalar_t cx = pos[i][0];
-            scalar_t cy = pos[i][1];
-            scalar_t cz = pos[i][2];
-            scalar_t r = 0.15;
-            // (ox + t dx)^2 + (oy + t dy)^2 + 4 (oz + t dz)^2 = r^2
-            scalar_t a = dx * dx + dy * dy + 4 * dz * dz;
-            scalar_t b = 2 * (dx * (ox - cx) + dy * (oy - cy) + 4 * dz * (oz - cz));
-            scalar_t c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz) - r * r;
-            scalar_t d = b * b - 4 * a * c;
-            if (d >= 0)
-            {
-                r = (-b - sqrt(d)) / (2 * a);
-                if (r > 1e-5)
-                {
-                    min_dist = min(min_dist, r);
-                }
-                else
-                {
-                    r = (-b + sqrt(d)) / (2 * a);
-                    if (r > 1e-5)
-                        min_dist = min(min_dist, r);
-                }
-            }
-        }
+        // for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
+        // {
+        //     if (i == b || i >= B)
+        //         continue;
+        //     scalar_t cx = pos[i][0];
+        //     scalar_t cy = pos[i][1];
+        //     scalar_t cz = pos[i][2];
+        //     scalar_t r = 0.15;
+        //     // (ox + t dx)^2 + (oy + t dy)^2 + 4 (oz + t dz)^2 = r^2
+        //     scalar_t a = dx * dx + dy * dy + 4 * dz * dz;
+        //     scalar_t b = 2 * (dx * (ox - cx) + dy * (oy - cy) + 4 * dz * (oz - cz));
+        //     scalar_t c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz) - r * r;
+        //     scalar_t d = b * b - 4 * a * c;
+        //     if (d >= 0)
+        //     {
+        //         r = (-b - sqrt(d)) / (2 * a);
+        //         if (r > 1e-5)
+        //         {
+        //             min_dist = min(min_dist, r);
+        //         }
+        //         else
+        //         {
+        //             r = (-b + sqrt(d)) / (2 * a);
+        //             if (r > 1e-5)
+        //                 min_dist = min(min_dist, r);
+        //         }
+        //     }
+        // }
 
         // balls
         for (int i = 0; i < balls.size(1); i++)
@@ -232,24 +234,24 @@ namespace
 
         // others
         const int batch_base = (b / n_drones_per_group) * n_drones_per_group;
-        for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
-        {
-            if (i == b || i >= B)
-                continue;
-            scalar_t cx = pos[j][i][0];
-            scalar_t cy = pos[j][i][1];
-            scalar_t cz = pos[j][i][2];
-            scalar_t r = 0.15;
-            scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
-            dist = max(1e-3f, sqrt(dist) - r);
-            if (dist < min_dist)
-            {
-                min_dist = dist;
-                nearest_ptx = ox + dist * (cx - ox);
-                nearest_pty = oy + dist * (cy - oy);
-                nearest_ptz = oz + dist * (cz - oz);
-            }
-        }
+        // for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
+        // {
+        //     if (i == b || i >= B)
+        //         continue;
+        //     scalar_t cx = pos[j][i][0];
+        //     scalar_t cy = pos[j][i][1];
+        //     scalar_t cz = pos[j][i][2];
+        //     scalar_t r = 0.15;
+        //     scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
+        //     dist = max(1e-3f, sqrt(dist) - r);
+        //     if (dist < min_dist)
+        //     {
+        //         min_dist = dist;
+        //         nearest_ptx = ox + dist * (cx - ox);
+        //         nearest_pty = oy + dist * (cy - oy);
+        //         nearest_ptz = oz + dist * (cz - oz);
+        //     }
+        // }
 
         // balls
         for (int i = 0; i < balls.size(1); i++)
@@ -350,8 +352,8 @@ namespace
         const int v = c % w;
 
         // 计算角度间隔
-        const scalar_t d_azimuth = azimuth_span / (W - 1);
-        const scalar_t d_elevation = elevation_span / (H - 1);
+        const scalar_t d_azimuth = azimuth_span / (W - 1) * M_PI / 180.0;     // 转换为弧度
+        const scalar_t d_elevation = elevation_span / (H - 1) * M_PI / 180.0; // 转换为弧度
 
         // 获取中心深度值
         const scalar_t d_center = depth[b][0][u * 2][v * 2];
@@ -400,10 +402,10 @@ void render_cuda(
     torch::Tensor pos_old,
     float drone_radius,
     int n_drones_per_group,
-    float elevation_min,
-    float elevation_max,
     float azimuth_min,
-    float azimuth_max)
+    float azimuth_max,
+    float elevation_min,
+    float elevation_max)
 {
     const int threads = 1024;
     size_t state_size = canvas.numel();
@@ -423,10 +425,10 @@ void render_cuda(
                                                                     pos_old.packed_accessor<scalar_t, 2, torch::RestrictPtrTraits, size_t>(),
                                                                     drone_radius,
                                                                     n_drones_per_group,
-                                                                    elevation_min,
-                                                                    elevation_max,
                                                                     azimuth_min,
-                                                                    azimuth_max); }));
+                                                                    azimuth_max,
+                                                                    elevation_min,
+                                                                    elevation_max); }));
 }
 
 void rerender_backward_cuda(

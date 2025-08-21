@@ -9,9 +9,12 @@ from torch.optim import AdamW  # 优化器
 from torch.optim.lr_scheduler import CosineAnnealingLR  # 学习率调度器
 from torch.utils.tensorboard import SummaryWriter  # 训练过程可视化
 from tqdm import tqdm  # 进度条工具
-
+import os
+from datetime import datetime
 import argparse
 from model import Model  # 自定义神经网络模型
+import numpy as np
+import cv2
 
 # 解析命令行参数
 parser = argparse.ArgumentParser()
@@ -19,6 +22,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--resume", default=None)  # 预训练模型路径
 parser.add_argument("--batch_size", type=int, default=64)  # 批大小
 parser.add_argument("--num_iters", type=int, default=50000)  # 训练迭代次数
+parser.add_argument("--run_name", type=str, default="your_run_name")  # 运行名称（用于TensorBoard记录）
+parser.add_argument("--exp_name", type=str, default="your_exp_name")  # 运行名称（用于TensorBoard记录）
+
 # 损失函数权重系数
 parser.add_argument("--coef_v", type=float, default=1.0, help="smooth l1 of norm(v_set - v_real)")
 parser.add_argument("--coef_speed", type=float, default=0.0, help="legacy")  # 遗留参数
@@ -34,43 +40,58 @@ parser.add_argument("--coef_bias", type=float, default=0.0, help="legacy")  # �
 parser.add_argument("--lr", type=float, default=1e-3)  # 学习率
 parser.add_argument("--grad_decay", type=float, default=0.4)  # 梯度衰减系数
 # 环境/传感器参数
-parser.add_argument("--speed_mtp", type=float, default=1.0)  # 最大目标速度倍数
-parser.add_argument("--fov_x_half_tan", type=float, default=0.53)  # 相机水平视场角正切值
-parser.add_argument("--timesteps", type=int, default=150)  # 每个episode的时间步长
-parser.add_argument("--cam_angle", type=int, default=10)  # 相机角度
+parser.add_argument("--speed_scale", type=float, default=1.0)  # 最大目标速度倍数
+parser.add_argument("--elevation_min", type=float, default=-90)  # 最小俯仰角
+parser.add_argument("--elevation_max", type=float, default=90)  # 最大俯仰角
+parser.add_argument("--azimuth_min", type=float, default=-180)  # 最小方位角
+parser.add_argument("--azimuth_max", type=float, default=180)  # 最大方位角
+parser.add_argument("--episode_length_s", type=int, default=10)  # 每个episode的时间步长
+parser.add_argument("--ctl_dt", type=float, default=1 / 50)  # 每个step的时间步长
 # 环境配置标志
-parser.add_argument("--single", default=False, action="store_true")  # 单一障碍模式
-parser.add_argument("--gate", default=False, action="store_true")  # 门形障碍模式
+parser.add_argument("--single", default=False, action="store_true")  # 单一agent训练模式
+parser.add_argument("--gate", default=False, action="store_true")  # 门形障碍开启与否
 parser.add_argument("--ground_voxels", default=False, action="store_true")  # 使用地面体素
 parser.add_argument("--scaffold", default=False, action="store_true")  # 脚手架模式
 parser.add_argument("--random_rotation", default=False, action="store_true")  # 随机旋转
 parser.add_argument("--yaw_drift", default=False, action="store_true")  # 偏航漂移模拟
 parser.add_argument("--no_odom", default=False, action="store_true")  # 不使用里程计
+parser.add_argument("--video", default=False, action="store_true")  # 使用相机
+
 args = parser.parse_args()
 
 # 初始化TensorBoard记录器
-writer = SummaryWriter()
+# specify directory for logging experiments
+log_root_path = os.path.join("logs", args.exp_name)
+log_root_path = os.path.abspath(log_root_path)
+print(f"[INFO] Logging experiment in directory: {log_root_path}")
+log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+if args.run_name:
+    log_dir += f"_{args.run_name}"
+log_dir = os.path.join(log_root_path, log_dir)
+writer = SummaryWriter(log_dir=log_dir, flush_secs=10)
 print(args)  # 打印参数配置
 
 device = torch.device("cuda")  # 使用CUDA设备
 
 # 创建环境实例
 env = Env(
-    args.batch_size,
-    # 576,
-    # 288,  # 深度图分辨率
-    64,
-    48,  # 深度图分辨率
-    args.grad_decay,
-    device,
-    fov_x_half_tan=args.fov_x_half_tan,
+    batch_size=args.batch_size,
+    width=64,
+    height=48,  # 深度图分辨率
+    # 64,
+    # 48,  # 深度图分辨率
+    azimuth_min=args.azimuth_min,
+    azimuth_max=args.azimuth_max,
+    elevation_min=args.elevation_min,
+    elevation_max=args.elevation_max,
+    grad_decay=args.grad_decay,
+    device=device,
     single=args.single,
     gate=args.gate,
     ground_voxels=args.ground_voxels,
     scaffold=args.scaffold,
-    speed_mtp=args.speed_mtp,
+    speed_scale=args.speed_scale,
     random_rotation=args.random_rotation,
-    cam_angle=args.cam_angle,
 )
 
 # 创建模型 (输入通道数根据是否使用里程计决定)
@@ -93,16 +114,46 @@ if args.resume:
 optim = AdamW(model.parameters(), args.lr)
 sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)  # 余弦退火调度
 
-ctl_dt = 1 / 15  # 控制时间间隔 (约15Hz)
 
 # 用于平滑记录训练指标
 scaler_q = defaultdict(list)
+
+if args.video:
+    fps = 50
+    width = 240
+    height = 150
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # 或使用 'XVID' 生成AVI
+    video_writer = cv2.VideoWriter("depth_video.mp4", fourcc, fps, (width, height), isColor=False)
+
+
+def record_video(depth_frames):
+    # 3. 创建视频写入器
+    depth_frames = depth_frames.cpu().numpy()
+    # 1. 归一化并转换为uint8
+    normalized = (depth_frames - 0.3) / (15 - 0.3 + 1e-8) * 255
+    normalized = normalized.astype(np.uint8)
+    video_writer.write(normalized)
 
 
 def smooth_dict(ori_dict):
     """将当前指标值添加到平滑队列"""
     for k, v in ori_dict.items():
         scaler_q[k].append(float(v))
+
+
+def show_depth_image(depth_img, fig_size=(18, 6), font_size=14):
+    # 创建可视化画布
+    plt.figure(figsize=fig_size)
+    plt.suptitle(f"Range Image", fontsize=font_size)
+    plt.subplot(111)
+    # 获取深度图的numpy数组并旋转180度调整方向
+    depth_np = depth_img.cpu().numpy()
+    min_value = depth_np.min()
+    max_value = depth_np.max()
+    plt.imshow(depth_np, cmap="jet", vmin=min_value, vmax=max_value)
+    plt.colorbar(label="Range (m)")
+    plt.tight_layout()
+    plt.show()
 
 
 def barrier(x: torch.Tensor, v_to_pt):
@@ -116,6 +167,8 @@ def is_save_iter(i):
         return (i + 1) % 250 == 0
     return (i + 1) % 1000 == 0
 
+
+time_steps = round(args.episode_length_s / args.ctl_dt)  # 每个episode的时间步数
 
 # 主训练循环
 pbar = tqdm(range(args.num_iters), ncols=80)  # 进度条
@@ -132,11 +185,10 @@ for i in pbar:
     vec_to_pt_history = []  # 到最近点的向量历史
     act_diff_history = []  # 动作变化历史
     v_preds = []  # 预测速度历史
-    vid = []  # 视频帧缓存
     v_net_feats = []  # 网络特征缓存
     h = None  # GRU隐藏状态
 
-    act_lag = 1  # 动作延迟
+    act_lag = 0  # 动作延迟
     act_buffer = [env.act] * (act_lag + 1)  # 动作缓冲区
 
     # 计算初始目标速度
@@ -144,7 +196,7 @@ for i in pbar:
 
     # 偏航漂移模拟（如果启用）
     if args.yaw_drift:
-        drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 / 15)  # 5度/秒的标准差
+        drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 * args.ctl_dt)  # 5度/秒的标准差
         zeros = torch.zeros_like(drift_av)
         ones = torch.ones_like(drift_av)
         # 构建漂移旋转矩阵
@@ -164,18 +216,19 @@ for i in pbar:
         ).reshape(B, 3, 3)
 
     # 时间步循环 (一个episode)
-    for t in range(args.timesteps):
+
+    for t in range(time_steps):
         # 随机控制时间间隔（模拟现实时间变化）
-        ctl_dt = normalvariate(1 / 15, 0.1 / 15)
+        ctl_dt = normalvariate(args.ctl_dt, 0.1 * args.ctl_dt)
 
         # 渲染深度图和光流图
-        depth, flow = env.render(ctl_dt)
+        depth, _ = env.render(ctl_dt)
         p_history.append(env.p)
         vec_to_pt_history.append(env.find_vec_to_nearest_pt())  # 计算到最近障碍物的向量
 
-        # 保存视频帧（特定迭代）
-        if is_save_iter(i):
-            vid.append(depth[4])  # 取batch中第5个样本
+        if args.video:
+            # 保存视频帧（特定迭代
+            record_video(depth[5])
 
         # 更新目标速度（考虑偏航漂移）
         if args.yaw_drift:
@@ -286,7 +339,7 @@ for i in pbar:
         + args.coef_v_pred * loss_v_pred
         + args.coef_collide * loss_collide
         + args.coef_ground_affinity * loss_ground_affinity
-    )  # 注意：这里修正了参数使用
+    )
 
     # 检查NaN损失
     if torch.isnan(loss):
@@ -330,40 +383,49 @@ for i in pbar:
             }
         )  # 平均速度×成功率
 
-        # 定期保存可视化结果
-        if is_save_iter(i):
-            # 位置历史图
-            fig_p, ax = plt.subplots()
-            p_history_sample = p_history[:, 4].cpu()
-            ax.plot(p_history_sample[:, 0], label="x")
-            ax.plot(p_history_sample[:, 1], label="y")
-            ax.plot(p_history_sample[:, 2], label="z")
-            ax.legend()
+        # # 定期保存可视化结果
+        # if is_save_iter(i):
+        #     # 位置历史图
+        #     fig_p, ax = plt.subplots()
+        #     p_history_sample = p_history[:, 4].cpu()
+        #     ax.plot(p_history_sample[:, 0], label="x")
+        #     ax.plot(p_history_sample[:, 1], label="y")
+        #     ax.plot(p_history_sample[:, 2], label="z")
+        #     ax.legend()
 
-            # 速度历史图
-            fig_v, ax = plt.subplots()
-            v_history_sample = v_history[:, 4].cpu()
-            ax.plot(v_history_sample[:, 0], label="x")
-            ax.plot(v_history_sample[:, 1], label="y")
-            ax.plot(v_history_sample[:, 2], label="z")
-            ax.legend()
+        #     # 速度历史图
+        #     fig_v, ax = plt.subplots()
+        #     v_history_sample = v_history[:, 4].cpu()
+        #     ax.plot(v_history_sample[:, 0], label="x")
+        #     ax.plot(v_history_sample[:, 1], label="y")
+        #     ax.plot(v_history_sample[:, 2], label="z")
+        #     ax.legend()
 
-            # 动作历史图
-            fig_a, ax = plt.subplots()
-            act_buffer_sample = act_buffer[:, 4].cpu()
-            ax.plot(act_buffer_sample[:, 0], label="x")
-            ax.plot(act_buffer_sample[:, 1], label="y")
-            ax.plot(act_buffer_sample[:, 2], label="z")
-            ax.legend()
+        #     # 动作历史图
+        #     fig_a, ax = plt.subplots()
+        #     act_buffer_sample = act_buffer[:, 4].cpu()
+        #     ax.plot(act_buffer_sample[:, 0], label="x")
+        #     ax.plot(act_buffer_sample[:, 1], label="y")
+        #     ax.plot(act_buffer_sample[:, 2], label="z")
+        #     ax.legend()
 
-            # 写入TensorBoard
-            writer.add_figure("p_history", fig_p, i + 1)
-            writer.add_figure("v_history", fig_v, i + 1)
-            writer.add_figure("a_reals", fig_a, i + 1)
+        #     # 写入TensorBoard
+        #     writer.add_figure("p_history", fig_p, i + 1)
+        #     writer.add_figure("v_history", fig_v, i + 1)
+        #     writer.add_figure("a_reals", fig_a, i + 1)
 
         # 定期保存模型
-        if (i + 1) % 10000 == 0:
-            torch.save(model.state_dict(), f"checkpoint{i//10000:04d}.pth")
+        if (i + 1) % 1000 == 0:
+            # -- Save PPO model
+            # saved_dict = {"model_state_dict": model.state_dict(), "optimizer_state_dict": optim.state_dict(), "iter": i}
+            # -- Save observation normalizer if used
+            saved_dict = {
+                "model_state_dict": model.state_dict(),
+            }
+            if args.video:
+                video_writer.release()
+                print("视频保存完成！")
+            torch.save(model.state_dict(), f"{log_dir}/checkpoint{i}.pt")
 
         # 定期记录指标到TensorBoard
         if (i + 1) % 25 == 0:

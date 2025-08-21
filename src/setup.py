@@ -8,8 +8,8 @@ setup(
             "quadsim_cuda",
             [
                 "quadsim.cpp",
-                "quadsim_kernel.cu",
-                # "new_quadsim_kernel.cu",
+                # "quadsim_kernel.cu",
+                "new_quadsim_kernel.cu",
                 "dynamics_kernel.cu",
             ],
         ),
