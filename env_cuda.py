@@ -170,9 +170,8 @@ class Env:
 
         rd = torch.rand((B // self.n_drones_per_group, 1), device=device).repeat_interleave(self.n_drones_per_group, 0)
         # self.max_speed = (0.75 + 2.5 * rd) * self.speed_mtp
-        self.max_speed = 1 + 17 * rd
-        # print("max speed:", self.max_speed)
-        scale = (self.max_speed - 0.5).clamp_min(1)
+        self.max_speed = 1.0 + 18.0 * rd  # * self.speed_scale # 0.75 -- 3.25  *3 --> 2.25 -- 9.75
+        scale = ((torch.rand_like(self.max_speed) * 18 + 1) - 0.5).clamp_min(1)
 
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
@@ -250,8 +249,16 @@ class Env:
             )
 
         # drone
+        # # self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
+        # self.pitch_ctl_delay = 18.18 + 15.12 * torch.rand(
+        #     (B, 1), device=device
+        # )  ## this is align with the aerial lab setting 30--50 ms
+        # self.yaw_ctl_delay_inv = 20 + 13.3 * torch.rand(
+        #     (B, 1), device=device
+        # )  # TODO this need to be aligned with the aerial lab setting 30 -- 50 ms
+
         self.pitch_ctl_delay = 12 + 1.2 * torch.randn((B, 1), device=device)
-        self.yaw_ctl_delay = 6 + 0.6 * torch.randn((B, 1), device=device)
+        self.yaw_ctl_delay_inv = 6 + 0.6 * torch.randn((B, 1), device=device)
 
         rd = torch.rand((B // self.n_drones_per_group, 1), device=device).repeat_interleave(self.n_drones_per_group, 0)
         scale = torch.cat([scale, rd + 0.5, torch.rand_like(scale) - 0.5], -1)
@@ -308,17 +315,17 @@ class Env:
             R,
             self.act,
             torch.randn((B, 3), device=device) * 0.2 + F.normalize(self.p_target - self.p),
-            torch.zeros_like(self.yaw_ctl_delay),
+            torch.zeros_like(self.yaw_ctl_delay_inv),
             5,
         )
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.2 + 0.1
+        self.margin = torch.rand((B,), device=device) * 0.15 + 0.15  # this is 1~2 times of skylark radius
 
         # drag coef
-        self.drag_2 = torch.rand((B, 2), device=device) * 0.15 + 0.3
-        self.drag_2[:, 0] = 0
-        self.z_drag_coef = torch.ones((B, 1), device=device)
+        self.drag_2 = torch.rand((B, 2), device=device) * 0.05 + 0.18  ## this is align with the aerial lab setting
+        self.drag_2[:, 0] = 0  ## this is align with the aerial lab setting
+        self.z_drag_coef = torch.ones((B, 1), device=device)  ## this is align with the aerial lab setting
 
     @staticmethod
     @torch.no_grad()
@@ -377,7 +384,7 @@ class Env:
         )
         return nearest_pt - p
 
-    def run(self, act_pred, ctl_dt=1 / 15, v_pred=None):
+    def run(self, act_pred, ctl_dt=1 / 50, v_pred=None):
         self.dg = self.dg * math.sqrt(1 - ctl_dt / 4) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt / 4)
         self.p_old = self.p
         self.act, self.p, self.v, self.a = run(
@@ -397,11 +404,11 @@ class Env:
             0.5,
         )
         # update attitude
-        alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
+        alpha = torch.exp(-self.yaw_ctl_delay_inv * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
 
-    def _run(self, act_pred, ctl_dt=1 / 15, v_pred=None):
+    def _run(self, act_pred, ctl_dt=1 / 50, v_pred=None):
         alpha = torch.exp(-self.pitch_ctl_delay * ctl_dt)
         self.act = act_pred * (1 - alpha) + self.act * alpha
         self.dg = self.dg * math.sqrt(1 - ctl_dt) + torch.randn_like(self.dg) * 0.2 * math.sqrt(ctl_dt)
@@ -419,6 +426,6 @@ class Env:
         self.a = a_next
 
         # update attitude
-        alpha = torch.exp(-self.yaw_ctl_delay * ctl_dt)
+        alpha = torch.exp(-self.yaw_ctl_delay_inv * ctl_dt)
         self.R_old = self.R.clone()
         self.R = quadsim_cuda.update_state_vec(self.R, self.act, v_pred, alpha, 5)
