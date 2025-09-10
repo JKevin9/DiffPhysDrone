@@ -76,8 +76,8 @@ device = torch.device("cuda")  # 使用CUDA设备
 # 创建环境实例
 env = Env(
     batch_size=args.batch_size,
-    width=64,
-    height=48,  # 深度图分辨率
+    width=240,
+    height=120,  # 深度图分辨率
     # 64,
     # 48,  # 深度图分辨率
     azimuth_min=args.azimuth_min,
@@ -130,7 +130,7 @@ def record_video(depth_frames):
     # 3. 创建视频写入器
     depth_frames = depth_frames.cpu().numpy()
     # 1. 归一化并转换为uint8
-    normalized = (depth_frames - 0.3) / (15 - 0.3 + 1e-8) * 255
+    normalized = (depth_frames - 0.3) / (24 - 0.3 + 1e-8) * 255
     normalized = normalized.astype(np.uint8)
     video_writer.write(normalized)
 
@@ -147,6 +147,7 @@ def show_depth_image(depth_img, fig_size=(18, 6), font_size=14):
     plt.suptitle(f"Range Image", fontsize=font_size)
     plt.subplot(111)
     # 获取深度图的numpy数组并旋转180度调整方向
+    depth_img = depth_img.clamp(0.3, 24)
     depth_np = depth_img.cpu().numpy()
     min_value = depth_np.min()
     max_value = depth_np.max()
@@ -290,11 +291,14 @@ for i in pbar:
     v_history = torch.stack(v_history)
 
     # 速度跟踪损失（平滑L1）
+    # 计算2秒内的帧数
+    frames = round(2.0 / args.ctl_dt)
+    # 速度跟踪损失（平滑L1）
     v_history_cum = v_history.cumsum(0)
-    v_history_avg = (v_history_cum[30:] - v_history_cum[:-30]) / 30  # 30帧滑动平均
+    v_history_avg = (v_history_cum[frames:] - v_history_cum[:-frames]) / frames  # 2s 平均滑动
     target_v_history = torch.stack(target_v_history)
     T, B, _ = v_history.shape
-    delta_v = torch.norm(v_history_avg - target_v_history[1 : 1 - 30], 2, -1)
+    delta_v = torch.norm(v_history_avg - target_v_history[1 : 1 - frames], 2, -1)
     loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
 
     # 速度预测损失（MSE）
