@@ -164,7 +164,7 @@ class Env:
 
         self._fov_x_half_tan = (0.95 + 0.1 * random.random()) * self.fov_x_half_tan
         self.n_drones_per_group = random.choice([4, 8])
-        self.drone_radius = random.uniform(0.1, 0.15)
+        self.drone_radius = random.uniform(0.15, 0.20)
         if self.single:
             self.n_drones_per_group = 1
 
@@ -320,7 +320,7 @@ class Env:
         )
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.15 + 0.15  # this is 1~2 times of skylark radius
+        self.margin = torch.rand((B,), device=device) * 0.05 + 0.17  # this is 1~2 times of skylark radius
 
         # drag coef
         self.drag_2 = torch.rand((B, 2), device=device) * 0.05 + 0.18  ## this is align with the aerial lab setting

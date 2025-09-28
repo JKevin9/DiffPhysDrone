@@ -109,7 +109,7 @@ sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)  # 余弦退火
 scaler_q = defaultdict(list)
 
 if args.video:
-    fps = 50
+    fps = round(1 / args.ctl_dt)
     width = 240
     height = 150
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # 或使用 'XVID' 生成AVI
@@ -301,8 +301,11 @@ for i in pbar:
     loss_bias = F.mse_loss(v_history, fwd_v[..., None] * target_v_history_normalized) * 3
 
     # 控制平滑性损失
-    jerk_history = act_buffer.diff(1, 0).mul(15)  # 加速度变化率
-    snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)  # 加加速度变化率
+
+    jerk_history = act_buffer.diff(1, 0).mul(round(1 / args.ctl_dt))  # 加速度变化率
+    snap_history = (
+        F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(round(1 / args.ctl_dt) ** 2)
+    )  # 加加速度变化率
     loss_d_acc = act_buffer.pow(2).sum(-1).mean()  # 加速度大小惩罚
     loss_d_jerk = jerk_history.pow(2).sum(-1).mean()  # 急动度惩罚
     loss_d_snap = snap_history.pow(2).sum(-1).mean()  # 加急动度惩罚
@@ -312,7 +315,7 @@ for i in pbar:
     distance = torch.norm(vec_to_pt_history, 2, -1)  # 到最近障碍物距离
     distance = distance - env.margin  # 减去安全裕度
     with torch.no_grad():
-        v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)  # 障碍物接近速度
+        v_to_pt = (-torch.diff(distance, 1, 1) * 9 * round(1 / args.ctl_dt)).clamp_min(1)  # 障碍物接近速度
     loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)  # 二次障碍物损失
     loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()  # 碰撞损失
 
