@@ -59,7 +59,7 @@ namespace
         const scalar_t oy = pos[b][1];
         const scalar_t oz = pos[b][2];
 
-        scalar_t min_dist = 15;
+        scalar_t min_dist = 24;
         // scalar_t t = (-1 - oz) / dz;
         // if (t > 0)
         //     min_dist = t;

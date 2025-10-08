@@ -51,34 +51,34 @@ namespace
 
         // others
         const int batch_base = (b / n_drones_per_group) * n_drones_per_group;
-        for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
-        {
-            if (i == b || i >= B)
-                continue;
-            scalar_t cx = pos[i][0];
-            scalar_t cy = pos[i][1];
-            scalar_t cz = pos[i][2];
-            scalar_t r = 0.15;
-            // (ox + t dx)^2 + (oy + t dy)^2 + 4 (oz + t dz)^2 = r^2
-            scalar_t a = dx * dx + dy * dy + 4 * dz * dz;
-            scalar_t b = 2 * (dx * (ox - cx) + dy * (oy - cy) + 4 * dz * (oz - cz));
-            scalar_t c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz) - r * r;
-            scalar_t d = b * b - 4 * a * c;
-            if (d >= 0)
-            {
-                r = (-b - sqrt(d)) / (2 * a);
-                if (r > 1e-5)
-                {
-                    min_dist = min(min_dist, r);
-                }
-                else
-                {
-                    r = (-b + sqrt(d)) / (2 * a);
-                    if (r > 1e-5)
-                        min_dist = min(min_dist, r);
-                }
-            }
-        }
+        // for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
+        // {
+        //     if (i == b || i >= B)
+        //         continue;
+        //     scalar_t cx = pos[i][0];
+        //     scalar_t cy = pos[i][1];
+        //     scalar_t cz = pos[i][2];
+        //     scalar_t r = 0.15;
+        //     // (ox + t dx)^2 + (oy + t dy)^2 + 4 (oz + t dz)^2 = r^2
+        //     scalar_t a = dx * dx + dy * dy + 4 * dz * dz;
+        //     scalar_t b = 2 * (dx * (ox - cx) + dy * (oy - cy) + 4 * dz * (oz - cz));
+        //     scalar_t c = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz) - r * r;
+        //     scalar_t d = b * b - 4 * a * c;
+        //     if (d >= 0)
+        //     {
+        //         r = (-b - sqrt(d)) / (2 * a);
+        //         if (r > 1e-5)
+        //         {
+        //             min_dist = min(min_dist, r);
+        //         }
+        //         else
+        //         {
+        //             r = (-b + sqrt(d)) / (2 * a);
+        //             if (r > 1e-5)
+        //                 min_dist = min(min_dist, r);
+        //         }
+        //     }
+        // }
 
         // balls
         for (int i = 0; i < balls.size(1); i++)
@@ -219,24 +219,24 @@ namespace
 
         // others
         const int batch_base = (b / n_drones_per_group) * n_drones_per_group;
-        for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
-        {
-            if (i == b || i >= B)
-                continue;
-            scalar_t cx = pos[j][i][0];
-            scalar_t cy = pos[j][i][1];
-            scalar_t cz = pos[j][i][2];
-            scalar_t r = 0.15;
-            scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
-            dist = max(1e-3f, sqrt(dist) - r);
-            if (dist < min_dist)
-            {
-                min_dist = dist;
-                nearest_ptx = ox + dist * (cx - ox);
-                nearest_pty = oy + dist * (cy - oy);
-                nearest_ptz = oz + dist * (cz - oz);
-            }
-        }
+        // for (int i = batch_base; i < batch_base + n_drones_per_group; i++)
+        // {
+        //     if (i == b || i >= B)
+        //         continue;
+        //     scalar_t cx = pos[j][i][0];
+        //     scalar_t cy = pos[j][i][1];
+        //     scalar_t cz = pos[j][i][2];
+        //     scalar_t r = 0.15;
+        //     scalar_t dist = (ox - cx) * (ox - cx) + (oy - cy) * (oy - cy) + 4 * (oz - cz) * (oz - cz);
+        //     dist = max(1e-3f, sqrt(dist) - r);
+        //     if (dist < min_dist)
+        //     {
+        //         min_dist = dist;
+        //         nearest_ptx = ox + dist * (cx - ox);
+        //         nearest_pty = oy + dist * (cy - oy);
+        //         nearest_ptz = oz + dist * (cz - oz);
+        //     }
+        // }
 
         // balls
         for (int i = 0; i < balls.size(1); i++)

@@ -40,14 +40,14 @@ parser.add_argument("--coef_bias", type=float, default=0.0, help="legacy")  # �
 parser.add_argument("--lr", type=float, default=1e-3)  # 学习率
 parser.add_argument("--grad_decay", type=float, default=0.4)  # 梯度衰减系数
 # 环境/传感器参数
-parser.add_argument("--speed_scale", type=float, default=1.0)  # 最大目标速度倍数
-parser.add_argument("--elevation_min", type=float, default=-90)  # 最小俯仰角
-parser.add_argument("--elevation_max", type=float, default=90)  # 最大俯仰角
-parser.add_argument("--azimuth_min", type=float, default=-180)  # 最小方位角
-parser.add_argument("--azimuth_max", type=float, default=180)  # 最大方位角
+parser.add_argument("--speed_mtp", type=float, default=1.0)  # 最大目标速度倍数
 parser.add_argument("--episode_length_s", type=int, default=10)  # 每个episode的时间步长
 parser.add_argument("--ctl_dt", type=float, default=1 / 50)  # 每个step的时间步长
 # 环境配置标志
+parser.add_argument("--elevation_min", type=float, default=-90)  # 垂直视场角下限
+parser.add_argument("--elevation_max", type=float, default=90)  # 垂直视场角上限
+parser.add_argument("--azimuth_min", type=float, default=-180)  # 水平视场角下限
+parser.add_argument("--azimuth_max", type=float, default=180)  # 水平
 parser.add_argument("--single", default=False, action="store_true")  # 单一agent训练模式
 parser.add_argument("--gate", default=False, action="store_true")  # 门形障碍开启与否
 parser.add_argument("--ground_voxels", default=False, action="store_true")  # 使用地面体素
@@ -70,10 +70,8 @@ if args.run_name:
 log_dir = os.path.join(log_root_path, log_dir)
 writer = SummaryWriter(log_dir=log_dir, flush_secs=10)
 print(args)  # 打印参数配置
+device = torch.device("cuda")
 
-device = torch.device("cuda")  # 使用CUDA设备
-
-# 创建环境实例
 env = Env(
     batch_size=args.batch_size,
     width=240,
@@ -90,15 +88,13 @@ env = Env(
     gate=args.gate,
     ground_voxels=args.ground_voxels,
     scaffold=args.scaffold,
-    speed_scale=args.speed_scale,
+    speed_mtp=args.speed_mtp,
     random_rotation=args.random_rotation,
 )
-
-# 创建模型 (输入通道数根据是否使用里程计决定)
 if args.no_odom:
     model = Model(7, 6)  # 无里程计: 7维状态输入
 else:
-    model = Model(7 + 3, 6)  # 有里程计: 10维状态输入
+    model = Model(7 + 3, 6)
 model = model.to(device)
 
 # 加载预训练模型（如果指定）
@@ -119,7 +115,7 @@ sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)  # 余弦退火
 scaler_q = defaultdict(list)
 
 if args.video:
-    fps = 50
+    fps = round(1 / args.ctl_dt)
     width = 240
     height = 150
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # 或使用 'XVID' 生成AVI
@@ -200,7 +196,6 @@ for i in pbar:
         drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 * args.ctl_dt)  # 5度/秒的标准差
         zeros = torch.zeros_like(drift_av)
         ones = torch.ones_like(drift_av)
-        # 构建漂移旋转矩阵
         R_drift = torch.stack(
             [
                 torch.cos(drift_av),
@@ -265,7 +260,7 @@ for i in pbar:
 
         # 预处理深度图
         x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02  # 深度转伪RGB+噪声
-        x = F.max_pool2d(x[:, None], 4, 4)  # 降采样 (64x48 -> 16x12)
+        x = F.max_pool2d(x[:, None], 3, 3)  # 降采样 (240x120 -> 80x40)
 
         # 模型前向传播
         act, values, h = model(x, state, h)  # 输出动作和隐藏状态
@@ -312,8 +307,11 @@ for i in pbar:
     loss_bias = F.mse_loss(v_history, fwd_v[..., None] * target_v_history_normalized) * 3
 
     # 控制平滑性损失
-    jerk_history = act_buffer.diff(1, 0).mul(15)  # 加速度变化率
-    snap_history = F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(15**2)  # 加加速度变化率
+
+    jerk_history = act_buffer.diff(1, 0).mul(round(1 / args.ctl_dt))  # 加速度变化率
+    snap_history = (
+        F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(round(1 / args.ctl_dt) ** 2)
+    )  # 加加速度变化率
     loss_d_acc = act_buffer.pow(2).sum(-1).mean()  # 加速度大小惩罚
     loss_d_jerk = jerk_history.pow(2).sum(-1).mean()  # 急动度惩罚
     loss_d_snap = snap_history.pow(2).sum(-1).mean()  # 加急动度惩罚
@@ -323,7 +321,7 @@ for i in pbar:
     distance = torch.norm(vec_to_pt_history, 2, -1)  # 到最近障碍物距离
     distance = distance - env.margin  # 减去安全裕度
     with torch.no_grad():
-        v_to_pt = (-torch.diff(distance, 1, 1) * 135).clamp_min(1)  # 障碍物接近速度
+        v_to_pt = (-torch.diff(distance, 1, 1) * 9 * round(1 / args.ctl_dt)).clamp_min(1)  # 障碍物接近速度
     loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)  # 二次障碍物损失
     loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()  # 碰撞损失
 

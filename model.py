@@ -10,18 +10,18 @@ class Model(nn.Module):
     def __init__(self, dim_obs=9, dim_action=4) -> None:
         super().__init__()
         self.stem = nn.Sequential(
-            nn.Conv2d(1, 32, 2, 2, bias=False),  # 1, 12, 16 -> 32, 6, 8
+            nn.Conv2d(1, 32, 3, 2, bias=False),  # 1, 40, 80 -> 32, 20, 40
             nn.LeakyReLU(0.05),
-            nn.Conv2d(32, 64, 3, bias=False),  #  32, 6, 8 -> 64, 4, 6
+            nn.Conv2d(32, 64, 3, 2, bias=False),  #  32, 20, 40 -> 64, 10, 20
             nn.LeakyReLU(0.05),
-            nn.Conv2d(64, 128, 3, bias=False),  #  64, 4, 6 -> 128, 2, 4
+            nn.Conv2d(64, 128, 3, 2, bias=False),  #  64, 10, 20 -> 128, 5, 10
             nn.LeakyReLU(0.05),
-            # nn.Conv2d(128, 128, 3, 2, bias=False),  #  64, 4, 6 -> 128, 2, 4
-            # nn.LeakyReLU(0.05),
+            nn.Conv2d(128, 256, 3, 2, bias=False),  #  64, 5, 10 -> 128, 3, 5
+            nn.LeakyReLU(0.05),
             # nn.Conv2d(128, 128, 3, 2, bias=False),  #  64, 4, 6 -> 128, 2, 4
             # nn.LeakyReLU(0.05),
             nn.Flatten(),
-            nn.Linear(128 * 2 * 4, 192, bias=False),
+            nn.Linear(1024, 192, bias=False),
         )
         self.state_proj = nn.Linear(dim_obs, 192)
         self.state_proj.weight.data.mul_(0.5)

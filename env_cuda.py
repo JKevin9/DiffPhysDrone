@@ -64,27 +64,23 @@ class Env:
         batch_size,
         width,
         height,
-        grad_decay,
         azimuth_min,
         azimuth_max,
         elevation_min,
         elevation_max,
+        grad_decay,
         device="cpu",
         single=False,
         gate=False,
         ground_voxels=False,
         scaffold=False,
-        speed_scale=1,
+        speed_mtp=1,
         random_rotation=False,
     ) -> None:
         self.device = device
         self.batch_size = batch_size
         self.width = width
         self.height = height
-        self.azimuth_min = azimuth_min
-        self.azimuth_max = azimuth_max
-        self.elevation_min = elevation_min
-        self.elevation_max = elevation_max
         self.grad_decay = grad_decay
         self.ball_w = torch.tensor([8.0, 18, 6, 0.2], device=device)
         self.ball_b = torch.tensor([0.0, -9, -1, 0.4], device=device)
@@ -101,9 +97,7 @@ class Env:
         self.v_wind_w = torch.tensor([1, 1, 0.2], device=device)
         self.g_std = torch.tensor([0.0, 0, -9.80665], device=device)
         self.roof_add = torch.tensor([0.0, 0.0, 2.5, 1.5, 1.5, 1.5], device=device)
-        self.sub_div = torch.linspace(0, 1.0 / 50, 2, device=device).reshape(
-            -1, 1, 1
-        )  # # 10 steps for each control step
+        self.sub_div = torch.linspace(0, 1.0 / 15, 10, device=device).reshape(-1, 1, 1)
         self.p_init = torch.as_tensor(
             [
                 [-1.5, -3.0, 1],
@@ -135,17 +129,35 @@ class Env:
         self.gate = gate
         self.ground_voxels = ground_voxels
         self.scaffold = scaffold
-        self.speed_scale = speed_scale
+        self.speed_mtp = speed_mtp
         self.random_rotation = random_rotation
+        self.azimuth_min = azimuth_min
+        self.azimuth_max = azimuth_max
+        self.elevation_min = elevation_min
+        self.elevation_max = elevation_max
         self.reset()
         # self.obj_avoid_grad_mtp = torch.tensor([0.5, 2., 1.], device=device)
 
     def reset(self):
         B = self.batch_size
         device = self.device
-        zeros = torch.zeros(B, device=device)
-        ones = torch.ones_like(zeros)
-        self.R_cam = torch.stack([ones, zeros, zeros, zeros, ones, zeros, zeros, zeros, ones], -1).reshape(B, 3, 3)
+        cam_angle = (torch.randn(B, device=device)) * 0.0
+        zeros = torch.zeros_like(cam_angle)
+        ones = torch.ones_like(cam_angle)
+        self.R_cam = torch.stack(
+            [
+                torch.cos(cam_angle),
+                zeros,
+                -torch.sin(cam_angle),
+                zeros,
+                ones,
+                zeros,
+                torch.sin(cam_angle),
+                zeros,
+                torch.cos(cam_angle),
+            ],
+            -1,
+        ).reshape(B, 3, 3)
 
         # env
         self.balls = torch.rand((B, 30, 4), device=device) * self.ball_w + self.ball_b
@@ -154,13 +166,15 @@ class Env:
         self.cyl_h = torch.rand((B, 2, 3), device=device) * self.cyl_h_w + self.cyl_h_b
 
         self.n_drones_per_group = random.choice([4, 8])
-        self.drone_radius = random.uniform(0.1, 0.15)
+        self.drone_radius = random.uniform(0.15, 0.20)
         if self.single:
             self.n_drones_per_group = 1
 
         rd = torch.rand((B // self.n_drones_per_group, 1), device=device).repeat_interleave(self.n_drones_per_group, 0)
+        # self.max_speed = (0.75 + 2.5 * rd) * self.speed_mtp
         self.max_speed = 1.0 + 18.0 * rd  # * self.speed_scale # 0.75 -- 3.25  *3 --> 2.25 -- 9.75
         scale = ((torch.rand_like(self.max_speed) * 18 + 1) - 0.5).clamp_min(1)
+
         self.thr_est_error = 1 + torch.randn(B, device=device) * 0.01
 
         roof = torch.rand((B,)) < 0.5
@@ -308,7 +322,7 @@ class Env:
         )
         self.R_old = self.R.clone()
         self.p_old = self.p
-        self.margin = torch.rand((B,), device=device) * 0.15 + 0.15  # this is 1~2 times of skylark radius
+        self.margin = torch.rand((B,), device=device) * 0.05 + 0.17  # this is 1~2 times of skylark radius
 
         # drag coef
         self.drag_2 = torch.rand((B, 2), device=device) * 0.05 + 0.18  ## this is align with the aerial lab setting
