@@ -1,430 +1,525 @@
-from collections import defaultdict
-import math
-from random import normalvariate  # 生成正态分布随机数
-from matplotlib import pyplot as plt  # 绘图库
-from env_cuda import Env  # 自定义CUDA加速的环境
-import torch
-from torch.nn import functional as F  # 神经网络函数工具
-from torch.optim import AdamW  # 优化器
-from torch.optim.lr_scheduler import CosineAnnealingLR  # 学习率调度器
-from torch.utils.tensorboard import SummaryWriter  # 训练过程可视化
-from tqdm import tqdm  # 进度条工具
-import os
-from datetime import datetime
+"""Train either versioned DiffPhys profile on independent procedural scenes."""
+
 import argparse
-from model import Model  # 自定义神经网络模型
+import json
 import numpy as np
-import cv2
+import random
+import time
+import torch
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from torch.nn import functional as F
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# 解析命令行参数
-parser = argparse.ArgumentParser()
-# 模型相关参数
-parser.add_argument("--resume", default=None)  # 预训练模型路径
-parser.add_argument("--batch_size", type=int, default=64)  # 批大小
-parser.add_argument("--num_iters", type=int, default=50000)  # 训练迭代次数
-parser.add_argument("--run_name", type=str, default="your_run_name")  # 运行名称（用于TensorBoard记录）
-parser.add_argument("--exp_name", type=str, default="your_exp_name")  # 运行名称（用于TensorBoard记录）
+from diffphys.checkpoints import load_checkpoint, save_checkpoint
+from diffphys.models import build_model
+from diffphys.perception import decode_action, policy_state
+from diffphys.profiles import PROFILES, get_profile
+from diffphys.scenes import TASK_PATTERNS, SceneConfig
 
-# 损失函数权重系数
-parser.add_argument("--coef_v", type=float, default=1.0, help="smooth l1 of norm(v_set - v_real)")
-parser.add_argument("--coef_speed", type=float, default=0.0, help="legacy")  # 遗留参数
-parser.add_argument("--coef_v_pred", type=float, default=2.0, help="mse loss for velocity estimation (no odom)")
-parser.add_argument("--coef_collide", type=float, default=2.0, help="softplus loss for collision")
-parser.add_argument("--coef_obj_avoidance", type=float, default=1.5, help="quadratic clearance loss")
-parser.add_argument("--coef_d_acc", type=float, default=0.01, help="control acceleration regularization")
-parser.add_argument("--coef_d_jerk", type=float, default=0.001, help="control jerk regularizatinon")
-parser.add_argument("--coef_d_snap", type=float, default=0.0, help="legacy")  # 遗留参数
-parser.add_argument("--coef_ground_affinity", type=float, default=0.0, help="legacy")  # 遗留参数
-parser.add_argument("--coef_bias", type=float, default=0.0, help="legacy")  # 遗留参数
-# 训练参数
-parser.add_argument("--lr", type=float, default=1e-3)  # 学习率
-parser.add_argument("--grad_decay", type=float, default=0.4)  # 梯度衰减系数
-# 环境/传感器参数
-parser.add_argument("--speed_mtp", type=float, default=1.0)  # 最大目标速度倍数
-parser.add_argument("--episode_length_s", type=int, default=10)  # 每个episode的时间步长
-parser.add_argument("--ctl_dt", type=float, default=1 / 15)  # 每个step的时间步长
-# 环境配置标志
-parser.add_argument("--fov_x_half_tan", type=float, default=0.53)
-parser.add_argument("--cam_angle", type=int, default=10)
-parser.add_argument("--single", default=False, action="store_true")  # 单一agent训练模式
-parser.add_argument("--gate", default=False, action="store_true")  # 门形障碍开启与否
-parser.add_argument("--ground_voxels", default=False, action="store_true")  # 使用地面体素
-parser.add_argument("--scaffold", default=False, action="store_true")  # 脚手架模式
-parser.add_argument("--random_rotation", default=False, action="store_true")  # 随机旋转
-parser.add_argument("--yaw_drift", default=False, action="store_true")  # 偏航漂移模拟
-parser.add_argument("--no_odom", default=False, action="store_true")  # 不使用里程计
-parser.add_argument("--video", default=False, action="store_true")  # 使用相机
 
-args = parser.parse_args()
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--profile", choices=tuple(PROFILES), required=True)
+    parser.add_argument("--resume", type=Path)
+    parser.add_argument("--batch_size", "--batch-size", type=int, default=64)
+    parser.add_argument("--num_iters", "--num-iters", type=int, default=50000)
+    parser.add_argument("--episode_length_s", "--episode-length-s", type=float, default=10)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--scene-config", type=Path)
+    parser.add_argument("--log-root", type=Path, default=Path("logs"))
+    parser.add_argument("--exp_name", default="procedural")
+    parser.add_argument("--run_name", default="")
+    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--video", action="store_true", help="Record consumed model depth inputs")
+    parser.add_argument(
+        "--video-seconds",
+        type=float,
+        default=60.0,
+        help="Maximum depth-video duration in seconds; used only with --video",
+    )
+    parser.add_argument(
+        "--timing",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="CUDA-synchronize and record reset, perception, nearest, forward, dynamics, backward",
+    )
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--grad_decay", type=float, default=0.4)
+    for name, default in dict(
+        v=1.0,
+        speed=0.0,
+        v_pred=2.0,
+        collide=2.0,
+        obj_avoidance=1.5,
+        d_acc=0.01,
+        d_jerk=0.001,
+        d_snap=0.0,
+        ground_affinity=0.0,
+        bias=0.0,
+    ).items():
+        parser.add_argument(f"--coef_{name}", type=float, default=default)
+    return parser
 
-# 初始化TensorBoard记录器
-# specify directory for logging experiments
-log_root_path = os.path.join("logs", args.exp_name)
-log_root_path = os.path.abspath(log_root_path)
-print(f"[INFO] Logging experiment in directory: {log_root_path}")
-log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-if args.run_name:
-    log_dir += f"_{args.run_name}"
-log_dir = os.path.join(log_root_path, log_dir)
-writer = SummaryWriter(log_dir=log_dir, flush_secs=10)
-print(args)  # 打印参数配置
-device = torch.device("cuda")
 
-env = Env(
-    args.batch_size,
-    64,
-    48,
-    args.grad_decay,
-    device,
-    fov_x_half_tan=args.fov_x_half_tan,
-    single=args.single,
-    gate=args.gate,
-    ground_voxels=args.ground_voxels,
-    scaffold=args.scaffold,
-    speed_mtp=args.speed_mtp,
-    random_rotation=args.random_rotation,
-    cam_angle=args.cam_angle,
+class DepthVideo:
+    """Write at most max_frames control steps, then release the file."""
+
+    def __init__(self, writer, max_frames):
+        self._writer = writer
+        self.remaining = max_frames
+
+    @property
+    def active(self):
+        return self.remaining > 0
+
+    def write(self, frame):
+        if self.remaining <= 0:
+            return
+        self._writer.write(frame)
+        self.remaining -= 1
+        if self.remaining == 0:
+            self.close()
+
+    def close(self):
+        writer, self._writer = self._writer, None
+        if writer is not None:
+            writer.release()
+
+
+@contextmanager
+def depth_video(path, profile, enabled, max_seconds):
+    if not enabled:
+        yield None
+        return
+    import cv2
+
+    max_frames = int(max_seconds / profile.control_dt + 1e-9)
+    if max_frames < 1:
+        raise ValueError(f"--video-seconds {max_seconds} is shorter than one control step")
+    video = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        1 / profile.control_dt,
+        (profile.image_width, profile.image_height),
+        isColor=False,
+    )
+    if not video.isOpened():
+        raise RuntimeError(f"Cannot open depth video: {path}")
+    recorder = DepthVideo(video, max_frames)
+    try:
+        yield recorder
+    finally:
+        recorder.close()
+
+
+class StageTimer:
+    """Accumulate CUDA-synchronized stage times. Disabled timers do not synchronize."""
+
+    def __init__(self, device, enabled):
+        self.device = torch.device(device)
+        self.enabled = enabled
+        self.totals = {}
+
+    def _sync(self):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    @contextmanager
+    def section(self, name):
+        if not self.enabled:
+            yield
+            return
+        self._sync()
+        started = time.perf_counter()
+        try:
+            yield
+        finally:
+            self._sync()
+            self.totals[name] = self.totals.get(name, 0.0) + (time.perf_counter() - started)
+
+    def reset(self):
+        self.totals = {}
+
+    def metrics(self):
+        values = {f"time_{name}_s": seconds for name, seconds in self.totals.items()}
+        values["time_total_s"] = float(sum(self.totals.values()))
+        return values
+
+
+def rollout_loss(env, model, args, video=None, timer=None):
+    spec = env.profile
+    dt = spec.control_dt
+    steps = round(args.episode_length_s / dt)
+    timer = timer or StageTimer(env.device, False)
+    positions, velocities, desireds, nearest, predictions = [], [], [], [], []
+    hidden = None
+    # Preserve the existing one-policy-step act_buffer delay.
+    actions = [env.act]
+    for _ in range(steps):
+        with timer.section("obs"):
+            image = env.observation(training=True)
+        if video is not None and video.active:
+            with timer.section("video"):
+                if spec.sensor == "camera":
+                    low, high = 3 / 24 - 0.6, 3 / 0.3 - 0.6
+                else:
+                    low, high = (
+                        spec.exp_scale * np.exp(-spec.exp_decay * d) - spec.linear_scale * d + spec.offset
+                        for d in (spec.max_depth, spec.min_depth)
+                    )
+                frame = (image[0, 0].detach().clamp(low, high) - low) / (high - low)
+                video.write((frame * 255).byte().cpu().numpy())
+        with timer.section("forward"):
+            state, frame, desired = policy_state(env.p, env.v, env.R, env.p_target, env.max_speed, spec.safety_margin)
+            positions.append(env.p)
+            velocities.append(env.v)
+            desireds.append(desired)
+            action, _, hidden = model(image, state.detach(), hidden)
+            acceleration, predicted = decode_action(action, frame)
+        with timer.section("nearest"):
+            nearest.append(env.find_vec_to_nearest_pt())
+        predictions.append(predicted)
+        acceleration = (acceleration - env.g_std) * env.thr_est_error[:, None] + env.g_std
+        previous = actions[-1]
+        actions.append(acceleration)
+        with timer.section("dynamics"):
+            env.run(previous, dt, env.p_target - env.p.detach())
+    with timer.section("loss"):
+        position, velocity, desired = map(torch.stack, (positions, velocities, desireds))
+        predictions, action = torch.stack(predictions), torch.stack(actions)
+        frames = min(round(2 / dt), steps - 1)
+        cumulative = velocity.cumsum(0)
+        average = (cumulative[frames:] - cumulative[:-frames]) / frames
+        reference = desired[1 : 1 - frames] if frames > 1 else desired[1:]
+        delta = (average - reference).norm(dim=-1)
+        direction = F.normalize(desired, dim=-1)
+        forward_speed = (velocity * direction).sum(-1)
+        distance = torch.stack(nearest).norm(dim=-1) - env.margin
+        with torch.no_grad():
+            approach = (-distance.diff(dim=1) * 9 / dt).clamp_min(1)
+        losses = {
+            "v": F.smooth_l1_loss(delta, torch.zeros_like(delta)),
+            "v_pred": F.mse_loss(predictions, velocity.detach()),
+            "bias": F.mse_loss(velocity, forward_speed[..., None] * direction) * 3,
+            "d_acc": action.square().sum(-1).mean(),
+            "d_jerk": (action.diff(dim=0) / dt).square().sum(-1).mean(),
+            "d_snap": (F.normalize(action - env.g_std, dim=-1).diff(dim=0).diff(dim=0) / dt**2).square().sum(-1).mean(),
+            "obj_avoidance": (approach * (1 - distance[:, 1:]).relu().square()).mean(),
+            "collide": (F.softplus(-32 * distance[:, 1:]) * approach).mean(),
+            "speed": F.smooth_l1_loss(forward_speed, desired.norm(dim=-1)),
+            "ground_affinity": position[..., 2].relu().square().mean(),
+        }
+        loss = sum(getattr(args, f"coef_{name}") * value for name, value in losses.items())
+        if not torch.isfinite(loss):
+            raise FloatingPointError("Non-finite training loss")
+        metrics = {f"loss_{name}": value.detach().item() for name, value in losses.items()}
+        metrics.update(
+            loss=loss.detach().item(),
+            collision_free_fraction=(distance.flatten(0, 1) > 0).all(0).float().mean().item(),
+            avg_speed=velocity.detach().norm(dim=-1).mean().item(),
+            sampled_speed_min=env.max_speed.min().item(),
+            sampled_speed_max=env.max_speed.max().item(),
+        )
+    return loss, metrics, steps
+
+
+LOG_WIDTH = 80
+LOG_PAD = 35
+# TensorBoard groups tags on "/". metrics.jsonl keeps the flat keys.
+TENSORBOARD_TAGS = {
+    "loss": "loss/total",
+    "loss_v": "loss/tracking/v",
+    "loss_v_pred": "loss/tracking/v_pred",
+    "loss_bias": "loss/tracking/bias",
+    "loss_speed": "loss/tracking/speed",
+    "loss_d_acc": "loss/smooth/acc",
+    "loss_d_jerk": "loss/smooth/jerk",
+    "loss_d_snap": "loss/smooth/snap",
+    "loss_obj_avoidance": "loss/safety/obj_avoidance",
+    "loss_collide": "loss/safety/collide",
+    "loss_ground_affinity": "loss/safety/ground_affinity",
+    "collision_free_fraction": "flight/collision_free",
+    "avg_speed": "flight/avg_speed",
+    "sampled_speed_min": "task/sampled_speed_min",
+    "sampled_speed_max": "task/sampled_speed_max",
+    "scene_task_attempts_mean": "scene/task_attempts_mean",
+    "scene_objects_mean": "scene/objects_mean",
+    "scene_objects_max": "scene/objects_max",
+    "time_reset_s": "time/rollout/reset",
+    "time_obs_s": "time/rollout/obs",
+    "time_nearest_s": "time/rollout/nearest",
+    "time_forward_s": "time/rollout/forward",
+    "time_dynamics_s": "time/rollout/dynamics",
+    "time_loss_s": "time/rollout/loss",
+    "time_backward_s": "time/learn/backward",
+    "time_optim_s": "time/learn/optim",
+    "time_scene_geometry_s": "time/scene/geometry",
+    "time_scene_task_s": "time/scene/task",
+    "time_scene_upload_s": "time/scene/upload",
+    "time_video_s": "time/io/video",
+    "time_log_s": "time/io/log",
+    "time_checkpoint_s": "time/io/checkpoint",
+    "time_total_s": "time/total",
+}
+LOSS_ROWS = (
+    ("loss_v", "Velocity loss"),
+    ("loss_v_pred", "Velocity prediction loss"),
+    ("loss_bias", "Bias loss"),
+    ("loss_d_acc", "Acceleration loss"),
+    ("loss_d_jerk", "Jerk loss"),
+    ("loss_d_snap", "Snap loss"),
+    ("loss_obj_avoidance", "Obstacle avoidance loss"),
+    ("loss_collide", "Collision loss"),
+    ("loss_speed", "Speed loss"),
+    ("loss_ground_affinity", "Ground affinity loss"),
 )
-if args.no_odom:
-    model = Model(7, 6)  # 无里程计: 7维状态输入
-else:
-    model = Model(7 + 3, 6)
-model = model.to(device)
-
-# 加载预训练模型（如果指定）
-if args.resume:
-    state_dict = torch.load(args.resume, map_location=device)
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, False)
-    if missing_keys:
-        print("missing_keys:", missing_keys)
-    if unexpected_keys:
-        print("unexpected_keys:", unexpected_keys)
-
-# 初始化优化器和学习率调度器
-optim = AdamW(model.parameters(), args.lr)
-sched = CosineAnnealingLR(optim, args.num_iters, args.lr * 0.01)  # 余弦退火调度
 
 
-# 用于平滑记录训练指标
-scaler_q = defaultdict(list)
-
-if args.video:
-    fps = round(1 / args.ctl_dt)
-    width = 240
-    height = 150
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")  # 或使用 'XVID' 生成AVI
-    video_writer = cv2.VideoWriter("depth_video.mp4", fourcc, fps, (width, height), isColor=False)
+def tensorboard_tag(key):
+    try:
+        return TENSORBOARD_TAGS[key]
+    except KeyError:
+        raise KeyError(f"ungrouped tensorboard metric: {key}") from None
 
 
-def record_video(depth_frames):
-    # 3. 创建视频写入器
-    depth_frames = depth_frames.cpu().numpy()
-    # 1. 归一化并转换为uint8
-    normalized = (depth_frames - 0.3) / (24 - 0.3 + 1e-8) * 255
-    normalized = normalized.astype(np.uint8)
-    video_writer.write(normalized)
+def write_tensorboard(writer, metrics, step):
+    for key, value in metrics.items():
+        writer.add_scalar(tensorboard_tag(key), value, step)
 
 
-def smooth_dict(ori_dict):
-    """将当前指标值添加到平滑队列"""
-    for k, v in ori_dict.items():
-        scaler_q[k].append(float(v))
+def _row(label, value):
+    return f"{f'{label}:':>{LOG_PAD}} {value}"
 
 
-def show_depth_image(depth_img, fig_size=(18, 6), font_size=14):
-    # 创建可视化画布
-    plt.figure(figsize=fig_size)
-    plt.suptitle(f"Range Image", fontsize=font_size)
-    plt.subplot(111)
-    # 获取深度图的numpy数组并旋转180度调整方向
-    depth_img = depth_img.clamp(0.3, 24)
-    depth_np = depth_img.cpu().numpy()
-    min_value = depth_np.min()
-    max_value = depth_np.max()
-    plt.imshow(depth_np, cmap="jet", vmin=min_value, vmax=max_value)
-    plt.colorbar(label="Range (m)")
-    plt.tight_layout()
-    plt.show()
+def _title(text):
+    return f"\033[1m{text.center(LOG_WIDTH)}\033[0m"
 
 
-def barrier(x: torch.Tensor, v_to_pt):
-    """障碍物避让损失函数（二次惩罚）"""
-    return (v_to_pt * (1 - x).relu().pow(2)).mean()
+def format_banner(spec, args, log_dir, first_iteration, steps):
+    rows = [
+        _row("Profile", spec.name),
+        _row("Control dt", f"{spec.control_dt * 1000:.1f} ms"),
+        _row("Batch", args.batch_size),
+        _row("Steps/iter", steps),
+        _row("Iterations", f"{first_iteration + 1} → {args.num_iters}"),
+        _row("Timing", "on" if args.timing else "off"),
+        _row("Seed", args.seed),
+        _row("Log dir", log_dir),
+    ]
+    return "\n".join(("#" * LOG_WIDTH, _title(f" Training {spec.name} "), "", *rows, ""))
 
 
-def is_save_iter(i):
-    """判断当前迭代是否需要保存结果"""
-    if i < 2000:
-        return (i + 1) % 250 == 0
-    return (i + 1) % 1000 == 0
+def format_status(iteration, total, metrics, steps, batch_size, timing_enabled, iteration_time, total_time, eta):
+    fps = steps * batch_size / max(iteration_time, 1e-9)
+    if timing_enabled:
+        collection = sum(
+            metrics.get(name, 0.0)
+            for name in (
+                "time_reset_s",
+                "time_obs_s",
+                "time_nearest_s",
+                "time_forward_s",
+                "time_dynamics_s",
+                "time_loss_s",
+                "time_video_s",
+            )
+        )
+        learning = metrics.get("time_backward_s", 0.0) + metrics.get("time_optim_s", 0.0)
+        computation = f"{fps:.0f} steps/s (collection: {collection:.3f}s, learning {learning:.3f}s)"
+    else:
+        computation = f"{fps:.0f} steps/s"
+    rows = [
+        _row("Computation", computation),
+        _row("Mean loss", f"{metrics['loss']:.4f}"),
+    ]
+    rows.extend(_row(label, f"{metrics[key]:.4f}") for key, label in LOSS_ROWS if key in metrics)
+    rows.extend(
+        (
+            _row("Collision free", f"{100 * metrics['collision_free_fraction']:.4f}"),
+            _row("Mean speed", f"{metrics['avg_speed']:.2f} m/s"),
+            _row(
+                "Sampled speed",
+                f"{metrics['sampled_speed_min']:.1f}-{metrics['sampled_speed_max']:.1f} m/s",
+            ),
+            _row("Scene geometry", f"{metrics['time_scene_geometry_s']:.3f}s"),
+            _row("Scene task", f"{metrics['time_scene_task_s']:.3f}s"),
+            _row("Scene upload", f"{metrics['time_scene_upload_s']:.3f}s"),
+            _row("Sample attempts", f"{metrics['scene_task_attempts_mean']:.1f}"),
+            _row("Scene objects", f"{metrics['scene_objects_mean']:.0f}/{metrics['scene_objects_max']}"),
+        )
+    )
+    if timing_enabled:
 
+        def step_ms(name):
+            return 1000.0 * metrics[f"time_{name}_s"] / steps
 
-time_steps = round(args.episode_length_s / args.ctl_dt)  # 每个episode的时间步数
-
-# 主训练循环
-pbar = tqdm(range(args.num_iters), ncols=80)  # 进度条
-B = args.batch_size
-for i in pbar:
-    # 重置环境和模型状态
-    env.reset()
-    model.reset()
-
-    # 初始化历史记录容器
-    p_history = []  # 位置历史
-    v_history = []  # 速度历史
-    target_v_history = []  # 目标速度历史
-    vec_to_pt_history = []  # 到最近点的向量历史
-    act_diff_history = []  # 动作变化历史
-    v_preds = []  # 预测速度历史
-    v_net_feats = []  # 网络特征缓存
-    h = None  # GRU隐藏状态
-
-    act_lag = 0  # 动作延迟
-    act_buffer = [env.act] * (act_lag + 1)  # 动作缓冲区
-
-    # 计算初始目标速度
-    target_v_raw = env.p_target - env.p
-
-    # 偏航漂移模拟（如果启用）
-    if args.yaw_drift:
-        drift_av = torch.randn(B, device=device) * (5 * math.pi / 180 * args.ctl_dt)  # 5度/秒的标准差
-        zeros = torch.zeros_like(drift_av)
-        ones = torch.ones_like(drift_av)
-        R_drift = torch.stack(
-            [
-                torch.cos(drift_av),
-                -torch.sin(drift_av),
-                zeros,
-                torch.sin(drift_av),
-                torch.cos(drift_av),
-                zeros,
-                zeros,
-                zeros,
-                ones,
-            ],
-            -1,
-        ).reshape(B, 3, 3)
-
-    # 时间步循环 (一个episode)
-
-    for t in range(time_steps):
-        # 随机控制时间间隔（模拟现实时间变化）
-        ctl_dt = normalvariate(args.ctl_dt, 0.1 * args.ctl_dt)
-
-        # 渲染深度图和光流图
-        depth, _ = env.render(ctl_dt)
-        p_history.append(env.p)
-        vec_to_pt_history.append(env.find_vec_to_nearest_pt())  # 计算到最近障碍物的向量
-
-        if args.video:
-            # 保存视频帧（特定迭代
-            record_video(depth[5])
-
-        # 更新目标速度（考虑偏航漂移）
-        if args.yaw_drift:
-            target_v_raw = torch.squeeze(target_v_raw[:, None] @ R_drift, 1)
-        else:
-            target_v_raw = env.p_target - env.p.detach()
-
-        # 环境执行动作
-        env.run(act_buffer[t], ctl_dt, target_v_raw)
-
-        # 获取当前旋转矩阵
-        R = env.R
-        fwd = env.R[:, :, 0].clone()
-        up = torch.zeros_like(fwd)
-        fwd[:, 2] = 0  # 水平前向
-        up[:, 2] = 1  # 垂直向上
-        fwd = F.normalize(fwd, 2, -1)  # 归一化
-        R = torch.stack([fwd, torch.cross(up, fwd), up], -1)  # 重建yaw-only旋转矩阵
-
-        # 构建状态向量
-        target_v_norm = torch.norm(target_v_raw, 2, -1, keepdim=True)
-        target_v_unit = target_v_raw / target_v_norm
-        target_v = target_v_unit * torch.minimum(target_v_norm, env.max_speed)  # 限速
-        state = [
-            torch.squeeze(target_v[:, None] @ R, 1),  # 目标速度（机体坐标系）
-            env.R[:, 2],  # Z轴方向
-            env.margin[:, None],  # 安全距离
-        ]
-        local_v = torch.squeeze(env.v[:, None] @ R, 1)  # 当前速度（机体坐标系）
-        if not args.no_odom:  # 包含里程计信息
-            state.insert(0, local_v)
-        state = torch.cat(state, -1)  # 拼接状态向量
-
-        # 预处理深度图
-        x = 3 / depth.clamp_(0.3, 24) - 0.6 + torch.randn_like(depth) * 0.02  # 深度转伪RGB+噪声
-        x = F.max_pool2d(x[:, None], 4, 4)  # 降采样 (64x48 -> 16x12)
-
-        # 模型前向传播
-        act, values, h = model(x, state, h)  # 输出动作和隐藏状态
-
-        # 转换动作到世界坐标系
-        a_pred, v_pred, *_ = (R @ act.reshape(B, 3, -1)).unbind(-1)
-        v_preds.append(v_pred)
-        # 应用推力估计误差校正
-        act = (a_pred - v_pred - env.g_std) * env.thr_est_error[:, None] + env.g_std
-        act_buffer.append(act)  # 存储到动作缓冲区
-        v_net_feats.append(torch.cat([act, local_v, h], -1))  # 保存网络特征
-
-        # 记录历史数据
-        v_history.append(env.v)
-        target_v_history.append(target_v)
-
-    # --- 损失计算 ---
-    p_history = torch.stack(p_history)
-    # 地面亲和损失（保持一定高度）
-    loss_ground_affinity = p_history[..., 2].relu().pow(2).mean()
-
-    act_buffer = torch.stack(act_buffer)
-    v_history = torch.stack(v_history)
-
-    # 速度跟踪损失（平滑L1）
-    # 计算2秒内的帧数
-    frames = round(2.0 / args.ctl_dt)
-    # 速度跟踪损失（平滑L1）
-    v_history_cum = v_history.cumsum(0)
-    v_history_avg = (v_history_cum[frames:] - v_history_cum[:-frames]) / frames  # 2s 平均滑动
-    target_v_history = torch.stack(target_v_history)
-    T, B, _ = v_history.shape
-    delta_v = torch.norm(v_history_avg - target_v_history[1 : 1 - frames], 2, -1)
-    loss_v = F.smooth_l1_loss(delta_v, torch.zeros_like(delta_v))
-
-    # 速度预测损失（MSE）
-    v_preds = torch.stack(v_preds)
-    loss_v_pred = F.mse_loss(v_preds, v_history.detach())
-
-    # 速度方向偏差损失
-    target_v_history_norm = torch.norm(target_v_history, 2, -1)
-    target_v_history_normalized = target_v_history / target_v_history_norm[..., None]
-    fwd_v = torch.sum(v_history * target_v_history_normalized, -1)  # 速度在目标方向投影
-    loss_bias = F.mse_loss(v_history, fwd_v[..., None] * target_v_history_normalized) * 3
-
-    # 控制平滑性损失
-
-    jerk_history = act_buffer.diff(1, 0).mul(round(1 / args.ctl_dt))  # 加速度变化率
-    snap_history = (
-        F.normalize(act_buffer - env.g_std).diff(1, 0).diff(1, 0).mul(round(1 / args.ctl_dt) ** 2)
-    )  # 加加速度变化率
-    loss_d_acc = act_buffer.pow(2).sum(-1).mean()  # 加速度大小惩罚
-    loss_d_jerk = jerk_history.pow(2).sum(-1).mean()  # 急动度惩罚
-    loss_d_snap = snap_history.pow(2).sum(-1).mean()  # 加急动度惩罚
-
-    # 障碍物避让损失
-    vec_to_pt_history = torch.stack(vec_to_pt_history)
-    distance = torch.norm(vec_to_pt_history, 2, -1)  # 到最近障碍物距离
-    distance = distance - env.margin  # 减去安全裕度
-    with torch.no_grad():
-        v_to_pt = (-torch.diff(distance, 1, 1) * 9 * round(1 / args.ctl_dt)).clamp_min(1)  # 障碍物接近速度
-    loss_obj_avoidance = barrier(distance[:, 1:], v_to_pt)  # 二次障碍物损失
-    loss_collide = F.softplus(distance[:, 1:].mul(-32)).mul(v_to_pt).mean()  # 碰撞损失
-
-    # 速度大小损失
-    speed_history = v_history.norm(2, -1)
-    loss_speed = F.smooth_l1_loss(fwd_v, target_v_history_norm)
-
-    # 总损失（加权求和）
-    loss = (
-        args.coef_v * loss_v
-        + args.coef_obj_avoidance * loss_obj_avoidance
-        + args.coef_bias * loss_bias
-        + args.coef_d_acc * loss_d_acc
-        + args.coef_d_jerk * loss_d_jerk
-        + args.coef_d_snap * loss_d_snap
-        + args.coef_speed * loss_speed
-        + args.coef_v_pred * loss_v_pred
-        + args.coef_collide * loss_collide
-        + args.coef_ground_affinity * loss_ground_affinity
+        rows.extend(
+            _row(label, f"{step_ms(name):.2f} ms/step")
+            for name, label in (
+                ("obs", "Observation"),
+                ("nearest", "Nearest point"),
+                ("forward", "Forward"),
+                ("dynamics", "Dynamics"),
+            )
+        )
+    if "time_video_s" in metrics:
+        rows.append(_row("Video", f"{metrics['time_video_s']:.3f}s"))
+    if "time_checkpoint_s" in metrics:
+        rows.append(_row("Checkpoint", f"{metrics['time_checkpoint_s']:.3f}s"))
+    footer = [
+        _row("Iteration time", f"{iteration_time:.2f}s"),
+        _row("Total time", f"{total_time:.2f}s"),
+        _row("ETA", f"{eta:.1f}s"),
+    ]
+    return "\n".join(
+        (
+            "#" * LOG_WIDTH,
+            _title(f" Learning iteration {iteration}/{total} "),
+            "",
+            *rows,
+            "-" * LOG_WIDTH,
+            *footer,
+        )
     )
 
-    # 检查NaN损失
-    if torch.isnan(loss):
-        print("loss is nan, exiting...")
-        exit(1)
 
-    # 更新进度条描述
-    pbar.set_description_str(f"loss: {loss:.3f}")
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    spec = get_profile(args.profile)
+    if (
+        args.batch_size < 1
+        or args.num_iters < 1
+        or args.save_every < 1
+        or round(args.episode_length_s / spec.control_dt) < 3
+    ):
+        parser.error("positive batch/iteration/save intervals and at least three episode steps required")
+    if args.video_seconds <= 0 or (args.video and int(args.video_seconds / spec.control_dt + 1e-9) < 1):
+        parser.error("--video-seconds must cover at least one control step")
+    if not str(args.device).startswith("cuda") or not torch.cuda.is_available():
+        parser.error("Differentiable training requires a CUDA device")
+    scene_config = SceneConfig.from_file(args.scene_config)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    from torch.utils.tensorboard import SummaryWriter
 
-    # 反向传播和优化
-    optim.zero_grad()
-    loss.backward()
-    optim.step()
-    sched.step()  # 更新学习率
+    from env_cuda import Env
 
-    # --- 评估与记录 ---
-    with torch.no_grad():
-        avg_speed = speed_history.mean(0)
-        # 判断任务成功（整个episode无碰撞）
-        success = torch.all(distance.flatten(0, 1) > 0, 0)
-        _success = success.sum() / B  # 成功率
+    env = Env(
+        args.batch_size,
+        grad_decay=args.grad_decay,
+        device=args.device,
+        profile=spec,
+        scene_config=scene_config,
+        seed=args.seed,
+    )
+    payload = None
+    if args.resume:
+        model, payload = load_checkpoint(args.resume, spec, args.device)
+    else:
+        model = build_model(spec).to(args.device)
+    model.train()
+    optimizer = AdamW(model.parameters(), lr=args.lr)
+    scheduler = CosineAnnealingLR(optimizer, args.num_iters, args.lr * 0.01)
+    first_iteration = 0
+    if payload is not None:
+        optimizer.load_state_dict(payload["optimizer_state_dict"])
+        scheduler.load_state_dict(payload["scheduler_state_dict"])
+        first_iteration = int(payload["iteration"])
+        if first_iteration >= args.num_iters:
+            parser.error("--num_iters must exceed the checkpoint's completed iteration")
+    name = datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f") + "_" + spec.name
+    if args.run_name:
+        name += "_" + args.run_name
+    log_dir = (args.log_root / args.exp_name / name).resolve()
+    log_dir.mkdir(parents=True, exist_ok=False)
+    run_config = dict(
+        profile=spec.metadata(),
+        scene=scene_config.metadata(),
+        task_patterns=TASK_PATTERNS,
+        seed=args.seed,
+        args={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        training_maps="independent procedural geometry",
+        policy_action_delay_steps=1,
+        resume_semantics="optimizer/scheduler restored; sampling restarts from the explicit seed",
+    )
+    (log_dir / "run_config.json").write_text(json.dumps(run_config, indent=2) + "\n")
+    episode_steps = round(args.episode_length_s / spec.control_dt)
+    print(format_banner(spec, args, log_dir, first_iteration, episode_steps), flush=True)
+    timer = StageTimer(args.device, args.timing)
+    train_started = time.perf_counter()
+    with (
+        SummaryWriter(log_dir=str(log_dir)) as writer,
+        (log_dir / "metrics.jsonl").open("w") as metrics_file,
+        depth_video(log_dir / "depth.mp4", spec, args.video, args.video_seconds) as video,
+    ):
+        for i in range(first_iteration, args.num_iters):
+            iter_started = time.perf_counter()
+            timer.reset()
+            with timer.section("reset"):
+                env.reset()
+            loss, metrics, steps = rollout_loss(env, model, args, video=video, timer=timer)
+            with timer.section("backward"):
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in model.parameters()):
+                    raise FloatingPointError("Non-finite policy gradient")
+            with timer.section("optim"):
+                optimizer.step()
+                scheduler.step()
+            metrics.update(env.scene.timing)
+            if args.timing:
+                metrics.update(timer.metrics())
+            log_started = time.perf_counter()
+            write_tensorboard(writer, metrics, i + 1)
+            metrics["time_log_s"] = time.perf_counter() - log_started
+            if (i + 1) % args.save_every == 0 or i + 1 == args.num_iters:
+                checkpoint_started = time.perf_counter()
+                save_checkpoint(
+                    log_dir / f"checkpoint_{i + 1:06d}.pt",
+                    model,
+                    spec,
+                    i + 1,
+                    run_config=run_config,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                )
+                metrics["time_checkpoint_s"] = time.perf_counter() - checkpoint_started
+            if args.timing:
+                metrics["time_total_s"] += metrics["time_log_s"] + metrics.get("time_checkpoint_s", 0.0)
+                late = {
+                    "time_log_s": metrics["time_log_s"],
+                    "time_total_s": metrics["time_total_s"],
+                }
+                if "time_checkpoint_s" in metrics:
+                    late["time_checkpoint_s"] = metrics["time_checkpoint_s"]
+                write_tensorboard(writer, late, i + 1)
+            metrics_file.write(json.dumps(dict(iteration=i + 1, **metrics)) + "\n")
+            metrics_file.flush()
+            completed = i + 1 - first_iteration
+            elapsed = time.perf_counter() - train_started
+            print(
+                format_status(
+                    i + 1,
+                    args.num_iters,
+                    metrics,
+                    steps,
+                    args.batch_size,
+                    args.timing,
+                    time.perf_counter() - iter_started,
+                    elapsed,
+                    elapsed / completed * (args.num_iters - (i + 1)),
+                ),
+                flush=True,
+            )
+    return log_dir
 
-        # 收集指标
-        smooth_dict(
-            {
-                "loss": loss,
-                "loss_v": loss_v,
-                "loss_v_pred": loss_v_pred,
-                "loss_obj_avoidance": loss_obj_avoidance,
-                "loss_d_acc": loss_d_acc,
-                "loss_d_jerk": loss_d_jerk,
-                "loss_d_snap": loss_d_snap,
-                "loss_bias": loss_bias,
-                "loss_speed": loss_speed,
-                "loss_collide": loss_collide,
-                "loss_ground_affinity": loss_ground_affinity,
-                "success": _success,
-                "max_speed": speed_history.max(0).values.mean(),
-                "avg_speed": avg_speed.mean(),
-                "ar": (success * avg_speed).mean(),
-            }
-        )  # 平均速度×成功率
 
-        # # 定期保存可视化结果
-        # if is_save_iter(i):
-        #     # 位置历史图
-        #     fig_p, ax = plt.subplots()
-        #     p_history_sample = p_history[:, 4].cpu()
-        #     ax.plot(p_history_sample[:, 0], label="x")
-        #     ax.plot(p_history_sample[:, 1], label="y")
-        #     ax.plot(p_history_sample[:, 2], label="z")
-        #     ax.legend()
-
-        #     # 速度历史图
-        #     fig_v, ax = plt.subplots()
-        #     v_history_sample = v_history[:, 4].cpu()
-        #     ax.plot(v_history_sample[:, 0], label="x")
-        #     ax.plot(v_history_sample[:, 1], label="y")
-        #     ax.plot(v_history_sample[:, 2], label="z")
-        #     ax.legend()
-
-        #     # 动作历史图
-        #     fig_a, ax = plt.subplots()
-        #     act_buffer_sample = act_buffer[:, 4].cpu()
-        #     ax.plot(act_buffer_sample[:, 0], label="x")
-        #     ax.plot(act_buffer_sample[:, 1], label="y")
-        #     ax.plot(act_buffer_sample[:, 2], label="z")
-        #     ax.legend()
-
-        #     # 写入TensorBoard
-        #     writer.add_figure("p_history", fig_p, i + 1)
-        #     writer.add_figure("v_history", fig_v, i + 1)
-        #     writer.add_figure("a_reals", fig_a, i + 1)
-
-        # 定期保存模型
-        if (i + 1) % 1000 == 0:
-            # -- Save PPO model
-            # saved_dict = {"model_state_dict": model.state_dict(), "optimizer_state_dict": optim.state_dict(), "iter": i}
-            # -- Save observation normalizer if used
-            saved_dict = {
-                "model_state_dict": model.state_dict(),
-            }
-            if args.video:
-                video_writer.release()
-                print("视频保存完成！")
-            torch.save(model.state_dict(), f"{log_dir}/checkpoint{i}.pt")
-
-        # 定期记录指标到TensorBoard
-        if (i + 1) % 25 == 0:
-            for k, v in scaler_q.items():
-                writer.add_scalar(k, sum(v) / len(v), i + 1)  # 写入平均值
-            scaler_q.clear()  # 清空队列
+if __name__ == "__main__":
+    main()

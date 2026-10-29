@@ -43,18 +43,32 @@ To build the CUDA operations, run the following command:
 pip install -e src
 ```
 
-## Training
+## 当前双 Profile 训练与 Newton Benchmark
+
+本 checkout 已实现 IMPLEMENT_PLAN.md。完整运行命令、输入契约、场景配置和验证边界见 [IMPLEMENTATION.md](IMPLEMENTATION.md)。
+
+~~~bash
+python main_cuda.py --profile vanilla
+python main_cuda.py --profile Newton-Modifed
+~~~
+
+默认每种 profile 训练 50,000 iterations；训练不读取 benchmark 地图。用户人工选定新版 checkpoint 后，通过 aerial_lab 的 scripts/competitor/newton/standard_test.py 运行固定测试任务。
+
+## Legacy Training Aliases
 
 To start the training process, use the following command:
 
 ```bash
-# For multi-agemt
+# Legacy filename; now selects independent procedural vanilla environments
 python main_cuda.py $(cat configs/multi_agent.args)
-# For single-agemt
+# Legacy filename; same vanilla profile
 python main_cuda.py $(cat configs/single_agent.args)
 ```
 
-## Evaluation
+## Upstream Historical Evaluation
+
+The following upstream simulator instructions do not describe the new versioned Newton benchmark checkpoints. See IMPLEMENTATION.md for the current evaluation entry point.
+
 You need to download the simulation validation code from the GitHub release page.
 To evaluate the trained model in multi-agent settings, use the following command to launch the simulator:
 ```bash

@@ -1,0 +1,19 @@
+{
+  "size": [256.0, 32.0],
+  "tile_size": 8.0,
+  "poles_per_tile": [5, 12],
+  "pole_radius": [0.1, 0.3],
+  "pole_tilt_deg": [0.0, 60.0],
+  "roof_height": [6.0, 8.0],
+  "spawn_agl": [0.5, 5.5],
+  "wall_thickness": 0.3,
+  "floating_count_scale": 1.2,
+  "active_floating_types": ["box", "sphere"],
+  "floating_height": [0.5, 5.0],
+  "floating_box_size": [0.1, 0.6],
+  "floating_sphere_radius": [0.1, 0.3],
+  "floating_ellipsoid_radius": [0.1, 0.6],
+  "floating_ellipsoid_scale": [0.5, 1.5],
+  "clearance": 0.38,
+  "max_sample_attempts": 10000
+}
