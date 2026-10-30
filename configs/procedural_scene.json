@@ -1,7 +1,7 @@
 {
   "size": [256.0, 32.0],
   "tile_size": 8.0,
-  "poles_per_tile": [5, 12],
+  "poles_per_tile": [2, 10],
   "pole_radius": [0.1, 0.3],
   "pole_tilt_deg": [0.0, 60.0],
   "roof_height": [6.0, 8.0],

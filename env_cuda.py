@@ -76,11 +76,13 @@ class Env:
         profile="vanilla",
         scene_config=None,
         seed=42,
+        airmode_extra_force_coef=0.0,
     ):
         self.profile = get_profile(profile) if isinstance(profile, str) else profile
         self.device = torch.device(device)
         self.batch_size, self.width, self.height = batch_size, width, height
         self.grad_decay = grad_decay
+        self.airmode_extra_force_coef = airmode_extra_force_coef
         self.g_std = torch.tensor([0.0, 0.0, -9.80665], device=device)
         self.v_wind_w = torch.tensor([1.0, 1.0, 0.2], device=device)
         self.sub_div = torch.linspace(0, self.profile.control_dt, 10, device=device).reshape(-1, 1, 1)
@@ -194,7 +196,7 @@ class Env:
             self.a,
             self.grad_decay,
             ctl_dt,
-            0.5,
+            self.airmode_extra_force_coef,
         )
         # update attitude
         alpha = torch.exp(-self.yaw_ctl_delay_inv * ctl_dt)

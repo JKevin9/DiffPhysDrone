@@ -14,6 +14,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from diffphys.checkpoints import load_checkpoint, save_checkpoint
+from diffphys.git_snapshot import capture_git_snapshot
 from diffphys.models import build_model
 from diffphys.perception import decode_action, policy_state
 from diffphys.profiles import PROFILES, get_profile
@@ -33,7 +34,7 @@ def build_parser():
     parser.add_argument("--log-root", type=Path, default=Path("logs"))
     parser.add_argument("--exp_name", default="procedural")
     parser.add_argument("--run_name", default="")
-    parser.add_argument("--save-every", type=int, default=1000)
+    parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--video", action="store_true", help="Record consumed model depth inputs")
     parser.add_argument(
         "--video-seconds",
@@ -49,12 +50,13 @@ def build_parser():
     )
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--grad_decay", type=float, default=0.4)
+    parser.add_argument("--airmode_extra_force_coef", type=float, default=0.0)
     for name, default in dict(
         v=1.0,
         speed=0.0,
-        v_pred=2.0,
-        collide=2.0,
-        obj_avoidance=1.5,
+        v_pred=0.0,
+        collide=7.5,
+        obj_avoidance=3.0,
         d_acc=0.01,
         d_jerk=0.001,
         d_snap=0.0,
@@ -299,7 +301,7 @@ def _title(text):
     return f"\033[1m{text.center(LOG_WIDTH)}\033[0m"
 
 
-def format_banner(spec, args, log_dir, first_iteration, steps):
+def format_banner(spec, args, log_dir, first_iteration, steps, git_state):
     rows = [
         _row("Profile", spec.name),
         _row("Control dt", f"{spec.control_dt * 1000:.1f} ms"),
@@ -309,6 +311,7 @@ def format_banner(spec, args, log_dir, first_iteration, steps):
         _row("Timing", "on" if args.timing else "off"),
         _row("Seed", args.seed),
         _row("Log dir", log_dir),
+        _row("Commit", f"{git_state['commit'][:12]} ({'dirty' if git_state['dirty'] else 'clean'})"),
     ]
     return "\n".join(("#" * LOG_WIDTH, _title(f" Training {spec.name} "), "", *rows, ""))
 
@@ -418,6 +421,7 @@ def main(argv=None):
         profile=spec,
         scene_config=scene_config,
         seed=args.seed,
+        airmode_extra_force_coef=args.airmode_extra_force_coef,
     )
     payload = None
     if args.resume:
@@ -439,6 +443,7 @@ def main(argv=None):
         name += "_" + args.run_name
     log_dir = (args.log_root / args.exp_name / name).resolve()
     log_dir.mkdir(parents=True, exist_ok=False)
+    git_state = capture_git_snapshot(log_dir)
     run_config = dict(
         profile=spec.metadata(),
         scene=scene_config.metadata(),
@@ -448,10 +453,11 @@ def main(argv=None):
         training_maps="independent procedural geometry",
         policy_action_delay_steps=1,
         resume_semantics="optimizer/scheduler restored; sampling restarts from the explicit seed",
+        git=git_state,
     )
     (log_dir / "run_config.json").write_text(json.dumps(run_config, indent=2) + "\n")
     episode_steps = round(args.episode_length_s / spec.control_dt)
-    print(format_banner(spec, args, log_dir, first_iteration, episode_steps), flush=True)
+    print(format_banner(spec, args, log_dir, first_iteration, episode_steps, git_state), flush=True)
     timer = StageTimer(args.device, args.timing)
     train_started = time.perf_counter()
     with (
